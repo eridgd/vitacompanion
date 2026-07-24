@@ -60,6 +60,8 @@ typedef struct ftpvita_client_info {
 	/* Client list */
 	struct ftpvita_client_info *next;
 	struct ftpvita_client_info *prev;
+	int listed;
+	int cleanup_by_server;
 	/* Offset for transfer resume */
 	unsigned int restore_point;
 } ftpvita_client_info_t;

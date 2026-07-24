@@ -9,7 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 VENDOR = ROOT / "vendor" / "libftpvita"
 
 
-def compile_and_run(source):
+def compile_and_run(source, support_sources=("ftpvita_path.c",)):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
         source_path = tmp / "test.c"
@@ -25,7 +25,7 @@ def compile_and_run(source):
                 "-I",
                 str(VENDOR),
                 str(source_path),
-                str(VENDOR / "ftpvita_path.c"),
+                *(str(VENDOR / name) for name in support_sources),
                 "-o",
                 str(exe_path),
             ],
@@ -154,6 +154,81 @@ class LibftpvitaCompatTests(unittest.TestCase):
         source = (VENDOR / "ftpvita.c").read_text()
         self.assertIn('client->recv_cmd_args = "";', source)
         self.assertNotIn("client->recv_cmd_args = client->recv_buffer;", source)
+
+    def test_send_all_handles_partial_writes_and_disconnects(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_io.h"
+
+            #include <stdlib.h>
+            #include <string.h>
+
+            static const char *expected;
+            static unsigned int offset;
+            static int fail_after;
+            static int zero_after;
+
+            static int mock_send(int socket, const void *buffer, unsigned int length, int flags)
+            {
+                unsigned int amount;
+                (void)socket;
+                (void)flags;
+
+                if (fail_after >= 0 && (int)offset >= fail_after)
+                    return -123;
+                if (zero_after >= 0 && (int)offset >= zero_after)
+                    return 0;
+
+                amount = length > 2 ? 2 : length;
+                if (memcmp(buffer, expected + offset, amount) != 0)
+                    exit(10);
+                offset += amount;
+                return (int)amount;
+            }
+
+            int main(void)
+            {
+                expected = "abcdef";
+                offset = 0;
+                fail_after = -1;
+                zero_after = -1;
+                if (ftpvita_send_all(mock_send, 1, expected, 6, 0) != 6 || offset != 6)
+                    return 1;
+
+                offset = 0;
+                fail_after = 2;
+                if (ftpvita_send_all(mock_send, 1, expected, 6, 0) != -123 || offset != 2)
+                    return 2;
+
+                offset = 0;
+                fail_after = -1;
+                zero_after = 2;
+                if (ftpvita_send_all(mock_send, 1, expected, 6, 0) >= 0 || offset != 2)
+                    return 3;
+
+                return 0;
+            }
+            """,
+            support_sources=("ftpvita_io.c",),
+        )
+
+    def test_disconnect_paths_are_bounded_and_shutdown_does_not_wait_under_mutex(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        self.assertIn("SCE_NET_SO_SNDTIMEO", source)
+        self.assertIn("SCE_NET_SO_RCVTIMEO", source)
+        self.assertIn("client_send_data_msg(client, buffer) < 0", source)
+        self.assertIn('"%15s"', source)
+        self.assertIn("sizeof(client->recv_buffer) - 1", source)
+        self.assertIn("if (server_stopping)", source)
+        self.assertIn("Server accept error:", source)
+
+        shutdown_start = source.index("static void client_list_thread_end()")
+        shutdown_end = source.index("static int client_thread", shutdown_start)
+        shutdown = source[shutdown_start:shutdown_end]
+        self.assertLess(
+            shutdown.index("sceKernelUnlockMutex(client_list_mtx, 1)"),
+            shutdown.index("sceKernelWaitThreadEnd(it->thid"),
+        )
 
 
 if __name__ == "__main__":

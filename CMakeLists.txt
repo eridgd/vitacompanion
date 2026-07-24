@@ -27,6 +27,8 @@ link_directories(
 add_library(ftpvita STATIC
         vendor/libftpvita/ftpvita.c
         vendor/libftpvita/ftpvita.h
+        vendor/libftpvita/ftpvita_io.c
+        vendor/libftpvita/ftpvita_io.h
         vendor/libftpvita/ftpvita_path.c
         vendor/libftpvita/ftpvita_path.h)
 

@@ -16,3 +16,11 @@ Local changes:
 - Add `EPSV` support using the existing passive data socket setup.
 - Add `NLST` support for clients that request filename-only listings.
 - Add `MDTM` support for clients that query remote modification times.
+- Bound control and data socket operations so disconnected clients cannot leave
+  worker threads blocked indefinitely.
+- Stop directory and file transfers when the peer disconnects or a partial
+  socket write fails.
+- Retry transient accept failures instead of permanently abandoning the FTP
+  listening socket under temporary resource pressure.
+- Detach clients before waiting for their threads during shutdown so network
+  state changes cannot deadlock the client-list mutex.

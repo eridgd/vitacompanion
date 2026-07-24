@@ -3,6 +3,7 @@
  */
 
 #include "ftpvita.h"
+#include "ftpvita_io.h"
 #include "ftpvita_path.h"
 
 #include <stdio.h>
@@ -29,6 +30,8 @@
 #define FTP_PORT 1337
 #define NET_INIT_SIZE (64 * 1024)
 #define DEFAULT_FILE_BUF_SIZE (4 * 1024 * 1024)
+#define CONTROL_SOCKET_TIMEOUT_US (30 * 1000 * 1000)
+#define DATA_SOCKET_TIMEOUT_US (15 * 1000 * 1000)
 
 #define FTP_DEFAULT_PATH   "/"
 
@@ -64,7 +67,9 @@ static unsigned int file_buf_size = DEFAULT_FILE_BUF_SIZE;
 static SceNetInAddr vita_addr;
 static SceUID server_thid;
 static int server_sockfd;
+static volatile int server_stopping = 0;
 static int number_clients = 0;
+static unsigned int next_client_id = 0;
 static ftpvita_client_info_t *client_list = NULL;
 static SceUID client_list_mtx;
 
@@ -89,15 +94,28 @@ static void log_func(ftpvita_log_cb_t log_cb, const char *s, ...)
 #define INFO(...) log_func(info_log_cb, __VA_ARGS__)
 #define DEBUG(...) log_func(debug_log_cb, __VA_ARGS__)
 
-#define client_send_ctrl_msg(cl, str) \
-	sceNetSend(cl->ctrl_sockfd, str, strlen(str), 0)
+static void socket_set_io_timeouts(int socket, int timeout_us)
+{
+	sceNetSetsockopt(socket, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO,
+		&timeout_us, sizeof(timeout_us));
+	sceNetSetsockopt(socket, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO,
+		&timeout_us, sizeof(timeout_us));
+}
 
-static inline void client_send_data_msg(ftpvita_client_info_t *client, const char *str)
+static int client_send_ctrl_msg(ftpvita_client_info_t *client, const char *str)
+{
+	return ftpvita_send_all(sceNetSend, client->ctrl_sockfd,
+		str, (unsigned int)strlen(str), 0);
+}
+
+static inline int client_send_data_msg(ftpvita_client_info_t *client, const char *str)
 {
 	if (client->data_con_type == FTP_DATA_CONNECTION_ACTIVE) {
-		sceNetSend(client->data_sockfd, str, strlen(str), 0);
+		return ftpvita_send_all(sceNetSend, client->data_sockfd,
+			str, (unsigned int)strlen(str), 0);
 	} else {
-		sceNetSend(client->pasv_sockfd, str, strlen(str), 0);
+		return ftpvita_send_all(sceNetSend, client->pasv_sockfd,
+			str, (unsigned int)strlen(str), 0);
 	}
 }
 
@@ -110,12 +128,12 @@ static inline int client_recv_data_raw(ftpvita_client_info_t *client, void *buf,
 	}
 }
 
-static inline void client_send_data_raw(ftpvita_client_info_t *client, const void *buf, unsigned int len)
+static inline int client_send_data_raw(ftpvita_client_info_t *client, const void *buf, unsigned int len)
 {
 	if (client->data_con_type == FTP_DATA_CONNECTION_ACTIVE) {
-		sceNetSend(client->data_sockfd, buf, len, 0);
+		return ftpvita_send_all(sceNetSend, client->data_sockfd, buf, len, 0);
 	} else {
-		sceNetSend(client->pasv_sockfd, buf, len, 0);
+		return ftpvita_send_all(sceNetSend, client->pasv_sockfd, buf, len, 0);
 	}
 }
 
@@ -163,12 +181,16 @@ static void cmd_SYST_func(ftpvita_client_info_t *client)
 	client_send_ctrl_msg(client, "215 UNIX Type: L8" FTPVITA_EOL);
 }
 
-static void client_prepare_passive_data_connection(ftpvita_client_info_t *client, SceNetSockaddrIn *picked)
+static void client_close_data_connection(ftpvita_client_info_t *client);
+
+static int client_prepare_passive_data_connection(ftpvita_client_info_t *client, SceNetSockaddrIn *picked)
 {
 	int ret;
-	UNUSED(ret);
 
 	unsigned int namelen;
+
+	if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
+		client_close_data_connection(client);
 
 	/* Create data mode socket name */
 	char data_socket_name[64];
@@ -180,6 +202,9 @@ static void client_prepare_passive_data_connection(ftpvita_client_info_t *client
 		SCE_NET_AF_INET,
 		SCE_NET_SOCK_STREAM,
 		0);
+	if (client->data_sockfd < 0)
+		return client->data_sockfd;
+	socket_set_io_timeouts(client->data_sockfd, DATA_SOCKET_TIMEOUT_US);
 
 	DEBUG("PASV data socket fd: %d\n", client->data_sockfd);
 
@@ -194,20 +219,32 @@ static void client_prepare_passive_data_connection(ftpvita_client_info_t *client
 		(SceNetSockaddr *)&client->data_sockaddr,
 		sizeof(client->data_sockaddr));
 	DEBUG("sceNetBind(): 0x%08X\n", ret);
+	if (ret < 0)
+		goto error;
 
 	/* Start listening */
 	ret = sceNetListen(client->data_sockfd, 128);
 	DEBUG("sceNetListen(): 0x%08X\n", ret);
+	if (ret < 0)
+		goto error;
 
 	/* Get the port that the PSVita has chosen */
 	namelen = sizeof(*picked);
-	sceNetGetsockname(client->data_sockfd, (SceNetSockaddr *)picked,
+	ret = sceNetGetsockname(client->data_sockfd, (SceNetSockaddr *)picked,
 		&namelen);
+	if (ret < 0)
+		goto error;
 
 	DEBUG("PASV mode port: 0x%04X\n", picked->sin_port);
 
 	/* Set the data connection type to passive! */
 	client->data_con_type = FTP_DATA_CONNECTION_PASSIVE;
+	return 0;
+
+error:
+	sceNetSocketClose(client->data_sockfd);
+	client->data_sockfd = -1;
+	return ret;
 }
 
 static unsigned short passive_ftp_port(const SceNetSockaddrIn *picked)
@@ -222,7 +259,10 @@ static void cmd_PASV_func(ftpvita_client_info_t *client)
 	char cmd[512];
 	SceNetSockaddrIn picked;
 
-	client_prepare_passive_data_connection(client, &picked);
+	if (client_prepare_passive_data_connection(client, &picked) < 0) {
+		client_send_ctrl_msg(client, "425 Cannot open passive connection." FTPVITA_EOL);
+		return;
+	}
 
 	/* Build the command */
 	sprintf(cmd, "227 Entering Passive Mode (%hhu,%hhu,%hhu,%hhu,%hhu,%hhu)" FTPVITA_EOL,
@@ -241,7 +281,10 @@ static void cmd_EPSV_func(ftpvita_client_info_t *client)
 	char cmd[128];
 	SceNetSockaddrIn picked;
 
-	client_prepare_passive_data_connection(client, &picked);
+	if (client_prepare_passive_data_connection(client, &picked) < 0) {
+		client_send_ctrl_msg(client, "425 Cannot open passive connection." FTPVITA_EOL);
+		return;
+	}
 	ftpvita_format_epsv_response(cmd, sizeof(cmd), passive_ftp_port(&picked));
 	client_send_ctrl_msg(client, cmd);
 }
@@ -280,6 +323,11 @@ static void cmd_PORT_func(ftpvita_client_info_t *client)
 		SCE_NET_AF_INET,
 		SCE_NET_SOCK_STREAM,
 		0);
+	if (client->data_sockfd < 0) {
+		client_send_ctrl_msg(client, "425 Cannot open active connection." FTPVITA_EOL);
+		return;
+	}
+	socket_set_io_timeouts(client->data_sockfd, DATA_SOCKET_TIMEOUT_US);
 
 	DEBUG("Client %i data socket fd: %d\n", client->num,
 		client->data_sockfd);
@@ -295,10 +343,9 @@ static void cmd_PORT_func(ftpvita_client_info_t *client)
 	client_send_ctrl_msg(client, "200 PORT command successful!" FTPVITA_EOL);
 }
 
-static void client_open_data_connection(ftpvita_client_info_t *client)
+static int client_open_data_connection(ftpvita_client_info_t *client)
 {
 	int ret;
-	UNUSED(ret);
 
 	unsigned int addrlen;
 
@@ -309,14 +356,20 @@ static void client_open_data_connection(ftpvita_client_info_t *client)
 			sizeof(client->data_sockaddr));
 
 		DEBUG("sceNetConnect(): 0x%08X\n", ret);
-	} else {
+		return ret;
+	} else if (client->data_con_type == FTP_DATA_CONNECTION_PASSIVE) {
 		/* Listen to the client using the data socket */
 		addrlen = sizeof(client->pasv_sockaddr);
 		client->pasv_sockfd = sceNetAccept(client->data_sockfd,
 			(SceNetSockaddr *)&client->pasv_sockaddr,
 			&addrlen);
 		DEBUG("PASV client fd: 0x%08X\n", client->pasv_sockfd);
+		if (client->pasv_sockfd >= 0)
+			socket_set_io_timeouts(client->pasv_sockfd, DATA_SOCKET_TIMEOUT_US);
+		return client->pasv_sockfd;
 	}
+
+	return SCE_NET_ERROR_ENOTCONN;
 }
 
 static void client_close_data_connection(ftpvita_client_info_t *client)
@@ -326,6 +379,8 @@ static void client_close_data_connection(ftpvita_client_info_t *client)
 	if (client->data_con_type == FTP_DATA_CONNECTION_PASSIVE) {
 		sceNetSocketClose(client->pasv_sockfd);
 	}
+	client->data_sockfd = -1;
+	client->pasv_sockfd = -1;
 	client->data_con_type = FTP_DATA_CONNECTION_NONE;
 }
 
@@ -367,6 +422,7 @@ static void send_LIST(ftpvita_client_info_t *client, const char *path)
 	SceIoStat stat;
 	char *devname;
 	int send_devices = 0;
+	int transfer_ok = 1;
 
 	/* "/" path is a special case, if we are here we have
 	 * to send the list of devices (aka mountpoints). */
@@ -384,15 +440,25 @@ static void send_LIST(ftpvita_client_info_t *client, const char *path)
 
 	client_send_ctrl_msg(client, "150 Opening ASCII mode data transfer for LIST." FTPVITA_EOL);
 
-	client_open_data_connection(client);
+	if (client_open_data_connection(client) < 0) {
+		if (!send_devices)
+			sceIoDclose(dir);
+		if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
+			client_close_data_connection(client);
+		client_send_ctrl_msg(client, "425 Cannot open data connection." FTPVITA_EOL);
+		return;
+	}
 
 	if (send_devices) {
 		for (i = 0; i < MAX_DEVICES; i++) {
 			if (device_list[i].valid) {
 				devname = device_list[i].name;
 				if (sceIoGetstat(devname, &stat) >= 0) {
-					gen_list_format(buffer, sizeof(buffer),	1, &stat, devname);
-					client_send_data_msg(client, buffer);
+					gen_list_format(buffer, sizeof(buffer), 1, &stat, devname);
+					if (client_send_data_msg(client, buffer) < 0) {
+						transfer_ok = 0;
+						break;
+					}
 				}
 			}
 		}
@@ -402,7 +468,10 @@ static void send_LIST(ftpvita_client_info_t *client, const char *path)
 		while (sceIoDread(dir, &dirent) > 0) {
 			gen_list_format(buffer, sizeof(buffer), SCE_S_ISDIR(dirent.d_stat.st_mode),
 				&dirent.d_stat, dirent.d_name);
-			client_send_data_msg(client, buffer);
+			if (client_send_data_msg(client, buffer) < 0) {
+				transfer_ok = 0;
+				break;
+			}
 			memset(&dirent, 0, sizeof(dirent));
 			memset(buffer, 0, sizeof(buffer));
 		}
@@ -413,7 +482,10 @@ static void send_LIST(ftpvita_client_info_t *client, const char *path)
 	DEBUG("Done sending LIST\n");
 
 	client_close_data_connection(client);
-	client_send_ctrl_msg(client, "226 Transfer complete." FTPVITA_EOL);
+	if (transfer_ok)
+		client_send_ctrl_msg(client, "226 Transfer complete." FTPVITA_EOL);
+	else
+		client_send_ctrl_msg(client, "426 Connection closed; transfer aborted." FTPVITA_EOL);
 }
 
 static void cmd_LIST_func(ftpvita_client_info_t *client)
@@ -433,6 +505,7 @@ static void send_NLST(ftpvita_client_info_t *client, const char *path)
 	SceIoStat stat;
 	char *devname;
 	int send_devices = 0;
+	int transfer_ok = 1;
 
 	if (strcmp(path, "/") == 0) {
 		send_devices = 1;
@@ -448,7 +521,14 @@ static void send_NLST(ftpvita_client_info_t *client, const char *path)
 
 	client_send_ctrl_msg(client, "150 Opening ASCII mode data transfer for NLST." FTPVITA_EOL);
 
-	client_open_data_connection(client);
+	if (client_open_data_connection(client) < 0) {
+		if (!send_devices)
+			sceIoDclose(dir);
+		if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
+			client_close_data_connection(client);
+		client_send_ctrl_msg(client, "425 Cannot open data connection." FTPVITA_EOL);
+		return;
+	}
 
 	if (send_devices) {
 		for (i = 0; i < MAX_DEVICES; i++) {
@@ -456,7 +536,10 @@ static void send_NLST(ftpvita_client_info_t *client, const char *path)
 				devname = device_list[i].name;
 				if (sceIoGetstat(devname, &stat) >= 0) {
 					snprintf(buffer, sizeof(buffer), "%s" FTPVITA_EOL, devname);
-					client_send_data_msg(client, buffer);
+					if (client_send_data_msg(client, buffer) < 0) {
+						transfer_ok = 0;
+						break;
+					}
 				}
 			}
 		}
@@ -465,7 +548,10 @@ static void send_NLST(ftpvita_client_info_t *client, const char *path)
 
 		while (sceIoDread(dir, &dirent) > 0) {
 			snprintf(buffer, sizeof(buffer), "%s" FTPVITA_EOL, dirent.d_name);
-			client_send_data_msg(client, buffer);
+			if (client_send_data_msg(client, buffer) < 0) {
+				transfer_ok = 0;
+				break;
+			}
 			memset(&dirent, 0, sizeof(dirent));
 		}
 
@@ -475,7 +561,10 @@ static void send_NLST(ftpvita_client_info_t *client, const char *path)
 	DEBUG("Done sending NLST\n");
 
 	client_close_data_connection(client);
-	client_send_ctrl_msg(client, "226 Transfer complete." FTPVITA_EOL);
+	if (transfer_ok)
+		client_send_ctrl_msg(client, "226 Transfer complete." FTPVITA_EOL);
+	else
+		client_send_ctrl_msg(client, "426 Connection closed; transfer aborted." FTPVITA_EOL);
 }
 
 static void cmd_NLST_func(ftpvita_client_info_t *client)
@@ -597,7 +686,8 @@ static void send_file(ftpvita_client_info_t *client, const char *path)
 {
 	unsigned char *buffer;
 	SceUID fd;
-	unsigned int bytes_read;
+	int bytes_read;
+	int transfer_ok = 1;
 
 	DEBUG("Opening: %s\n", path);
 
@@ -607,22 +697,38 @@ static void send_file(ftpvita_client_info_t *client, const char *path)
 
 		buffer = malloc(file_buf_size);
 		if (buffer == NULL) {
+			sceIoClose(fd);
 			client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
 			return;
 		}
 
-		client_open_data_connection(client);
+		if (client_open_data_connection(client) < 0) {
+			sceIoClose(fd);
+			free(buffer);
+			if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
+				client_close_data_connection(client);
+			client_send_ctrl_msg(client, "425 Cannot open data connection." FTPVITA_EOL);
+			return;
+		}
 		client_send_ctrl_msg(client, "150 Opening Image mode data transfer." FTPVITA_EOL);
 
 		while ((bytes_read = sceIoRead (fd, buffer, file_buf_size)) > 0) {
-			client_send_data_raw(client, buffer, bytes_read);
+			if (client_send_data_raw(client, buffer, (unsigned int)bytes_read) != bytes_read) {
+				transfer_ok = 0;
+				break;
+			}
 		}
+		if (bytes_read < 0)
+			transfer_ok = 0;
 
 		sceIoClose(fd);
 		free(buffer);
 		client->restore_point = 0;
-		client_send_ctrl_msg(client, "226 Transfer completed." FTPVITA_EOL);
 		client_close_data_connection(client);
+		if (transfer_ok)
+			client_send_ctrl_msg(client, "226 Transfer completed." FTPVITA_EOL);
+		else
+			client_send_ctrl_msg(client, "426 Connection closed; transfer aborted." FTPVITA_EOL);
 
 	} else {
 		client_send_ctrl_msg(client, "550 File not found." FTPVITA_EOL);
@@ -648,6 +754,7 @@ static void receive_file(ftpvita_client_info_t *client, const char *path)
 	unsigned char *buffer;
 	SceUID fd;
 	int bytes_recv;
+	int write_result;
 
 	DEBUG("Opening: %s\n", path);
 
@@ -665,15 +772,28 @@ static void receive_file(ftpvita_client_info_t *client, const char *path)
 
 		buffer = malloc(file_buf_size);
 		if (buffer == NULL) {
+			sceIoClose(fd);
 			client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
 			return;
 		}
 
-		client_open_data_connection(client);
+		if (client_open_data_connection(client) < 0) {
+			sceIoClose(fd);
+			free(buffer);
+			if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
+				client_close_data_connection(client);
+			sceIoRemove(path);
+			client_send_ctrl_msg(client, "425 Cannot open data connection." FTPVITA_EOL);
+			return;
+		}
 		client_send_ctrl_msg(client, "150 Opening Image mode data transfer." FTPVITA_EOL);
 
 		while ((bytes_recv = client_recv_data_raw(client, buffer, file_buf_size)) > 0) {
-			sceIoWrite(fd, buffer, bytes_recv);
+			write_result = sceIoWrite(fd, buffer, bytes_recv);
+			if (write_result != bytes_recv) {
+				bytes_recv = SCE_NET_ERROR_EIO;
+				break;
+			}
 		}
 
 		sceIoClose(fd);
@@ -935,47 +1055,62 @@ static void client_list_add(ftpvita_client_info_t *client)
 		client_list = client;
 	}
 	client->restore_point = 0;
+	client->listed = 1;
+	client->cleanup_by_server = 0;
 	number_clients++;
 
 	sceKernelUnlockMutex(client_list_mtx, 1);
 }
 
-static void client_list_delete(ftpvita_client_info_t *client)
+static int client_list_delete(ftpvita_client_info_t *client)
 {
+	int client_owns_cleanup = 1;
+
 	/* Remove the client from the client list */
 	sceKernelLockMutex(client_list_mtx, 1, NULL);
 
-	if (client->prev) {
-		client->prev->next = client->next;
-	}
-	if (client->next) {
-		client->next->prev = client->prev;
-	}
-	if (client == client_list) {
-		client_list = client->next;
-	}
+	if (client->cleanup_by_server) {
+		client_owns_cleanup = 0;
+	} else if (client->listed) {
+		if (client->prev) {
+			client->prev->next = client->next;
+		}
+		if (client->next) {
+			client->next->prev = client->prev;
+		}
+		if (client == client_list) {
+			client_list = client->next;
+		}
 
-	number_clients--;
+		client->listed = 0;
+		number_clients--;
+	}
 
 	sceKernelUnlockMutex(client_list_mtx, 1);
+	return client_owns_cleanup;
 }
 
 static void client_list_thread_end()
 {
-	ftpvita_client_info_t *it, *next;
-	SceUID client_thid;
+	ftpvita_client_info_t *clients, *it, *next;
 	const int data_abort_flags = SCE_NET_SOCKET_ABORT_FLAG_RCV_PRESERVATION |
 				SCE_NET_SOCKET_ABORT_FLAG_SND_PRESERVATION;
 
 	sceKernelLockMutex(client_list_mtx, 1, NULL);
 
-	it = client_list;
+	clients = client_list;
+	client_list = NULL;
+	number_clients = 0;
+	for (it = clients; it; it = it->next) {
+		it->listed = 0;
+		it->cleanup_by_server = 1;
+	}
 
-	/* Iterate over the client list and close their sockets */
-	while (it) {
-		next = it->next;
-		client_thid = it->thid;
+	sceKernelUnlockMutex(client_list_mtx, 1);
 
+	/* Abort every client before waiting so one stuck worker cannot delay
+	 * cancellation of all of the others. */
+	for (it = clients; it; it = it->next) {
 		/* Abort the client's control socket, only abort
 		 * receiving data so we can still send control messages */
 		sceNetSocketAbort(it->ctrl_sockfd,
@@ -988,14 +1123,15 @@ static void client_list_thread_end()
 				sceNetSocketAbort(it->pasv_sockfd, data_abort_flags);
 			}
 		}
-
-		/* Wait until the client threads ends */
-		sceKernelWaitThreadEnd(client_thid, NULL, NULL);
-
-		it = next;
 	}
 
-	sceKernelUnlockMutex(client_list_mtx, 1);
+	/* Wait for each client thread and release its server-owned state. */
+	for (it = clients; it; it = next) {
+		next = it->next;
+		/* Wait until the client threads ends */
+		sceKernelWaitThreadEnd(it->thid, NULL, NULL);
+		free(it);
+	}
 }
 
 static int client_thread(SceSize args, void *argp)
@@ -1003,23 +1139,30 @@ static int client_thread(SceSize args, void *argp)
 	char cmd[16];
 	cmd_dispatch_func dispatch_func;
 	ftpvita_client_info_t *client = *(ftpvita_client_info_t **)argp;
+	int client_owns_cleanup;
 
 	DEBUG("Client thread %i started!\n", client->num);
 
-	client_send_ctrl_msg(client, "220 FTPVita Server ready." FTPVITA_EOL);
+	if (client_send_ctrl_msg(client, "220 FTPVita Server ready." FTPVITA_EOL) < 0)
+		goto cleanup;
 
 	while (1) {
 		memset(client->recv_buffer, 0, sizeof(client->recv_buffer));
 
-		client->n_recv = sceNetRecv(client->ctrl_sockfd, client->recv_buffer, sizeof(client->recv_buffer), 0);
+		client->n_recv = sceNetRecv(client->ctrl_sockfd, client->recv_buffer,
+			sizeof(client->recv_buffer) - 1, 0);
 		if (client->n_recv > 0) {
+			client->recv_buffer[client->n_recv] = '\0';
 			DEBUG("Received %i bytes from client number %i:\n",
 				client->n_recv, client->num);
 
 			INFO("\t%i> %s", client->num, client->recv_buffer);
 
 			/* The command is the first chars until the first space */
-			sscanf(client->recv_buffer, "%s", cmd);
+			if (sscanf(client->recv_buffer, "%15s", cmd) != 1) {
+				client_send_ctrl_msg(client, "500 Empty command." FTPVITA_EOL);
+				continue;
+			}
 
 			client->recv_cmd_args = strchr(client->recv_buffer, ' ');
 			if (client->recv_cmd_args)
@@ -1032,6 +1175,8 @@ static int client_thread(SceSize args, void *argp)
 
 			if ((dispatch_func = get_dispatch_func(cmd))) {
 				dispatch_func(client);
+				if (dispatch_func == cmd_QUIT_func)
+					break;
 			} else {
 				client_send_ctrl_msg(client, "502 Sorry, command not implemented. :(" FTPVITA_EOL);
 			}
@@ -1039,8 +1184,6 @@ static int client_thread(SceSize args, void *argp)
 		} else if (client->n_recv == 0) {
 			/* Value 0 means connection closed by the remote peer */
 			INFO("Connection closed by the client %i.\n", client->num);
-			/* Delete itself from the client list */
-			client_list_delete(client);
 			break;
 		} else if (client->n_recv == SCE_NET_ERROR_EINTR) {
 			/* Socket aborted (ftpvita_fini() called) */
@@ -1049,10 +1192,12 @@ static int client_thread(SceSize args, void *argp)
 		} else {
 			/* Other errors */
 			INFO("Client %i socket error: 0x%08X\n", client->num, client->n_recv);
-			client_list_delete(client);
 			break;
 		}
 	}
+
+cleanup:
+	client_owns_cleanup = client_list_delete(client);
 
 	/* Close the client's socket */
 	sceNetSocketClose(client->ctrl_sockfd);
@@ -1067,7 +1212,8 @@ static int client_thread(SceSize args, void *argp)
 
 	DEBUG("Client thread %i exiting!\n", client->num);
 
-	free(client);
+	if (client_owns_cleanup)
+		free(client);
 
 	sceKernelExitDeleteThread(0);
 	return 0;
@@ -1089,6 +1235,8 @@ static int server_thread(SceSize args, void *argp)
 		0);
 
 	DEBUG("Server socket fd: %d\n", server_sockfd);
+	if (server_sockfd < 0)
+		goto exit;
 
 	/* Fill the server's address */
 	serveraddr.sin_family = SCE_NET_AF_INET;
@@ -1098,10 +1246,14 @@ static int server_thread(SceSize args, void *argp)
 	/* Bind the server's address to the socket */
 	ret = sceNetBind(server_sockfd, (SceNetSockaddr *)&serveraddr, sizeof(serveraddr));
 	DEBUG("sceNetBind(): 0x%08X\n", ret);
+	if (ret < 0)
+		goto close_and_exit;
 
 	/* Start listening */
 	ret = sceNetListen(server_sockfd, 128);
 	DEBUG("sceNetListen(): 0x%08X\n", ret);
+	if (ret < 0)
+		goto close_and_exit;
 
 	while (1) {
 		/* Accept clients */
@@ -1114,6 +1266,7 @@ static int server_thread(SceSize args, void *argp)
 		client_sockfd = sceNetAccept(server_sockfd, (SceNetSockaddr *)&clientaddr, &addrlen);
 		if (client_sockfd >= 0) {
 			DEBUG("New connection, client fd: 0x%08X\n", client_sockfd);
+			socket_set_io_timeouts(client_sockfd, CONTROL_SOCKET_TIMEOUT_US);
 
 			/* Get the client's IP address */
 			char remote_ip[16];
@@ -1122,25 +1275,38 @@ static int server_thread(SceSize args, void *argp)
 				remote_ip,
 				sizeof(remote_ip));
 
+			unsigned int client_id = next_client_id++;
 			INFO("Client %i connected, IP: %s port: %i\n",
-				number_clients, remote_ip, clientaddr.sin_port);
+				client_id, remote_ip, clientaddr.sin_port);
 
 			/* Create a new thread for the client */
 			char client_thread_name[64];
 			sprintf(client_thread_name, "FTPVita_client_%i_thread",
-				number_clients);
+				client_id);
 
 			SceUID client_thid = sceKernelCreateThread(
 				client_thread_name, client_thread,
 				0x10000100, 0x10000, 0, 0, NULL);
 
-			DEBUG("Client %i thread UID: 0x%08X\n", number_clients, client_thid);
+			DEBUG("Client %i thread UID: 0x%08X\n", client_id, client_thid);
+			if (client_thid < 0) {
+				sceNetSocketClose(client_sockfd);
+				continue;
+			}
 
 			/* Allocate the ftpvita_client_info_t struct for the new client */
 			ftpvita_client_info_t *client = malloc(sizeof(*client));
-			client->num = number_clients;
+			if (client == NULL) {
+				sceKernelDeleteThread(client_thid);
+				sceNetSocketClose(client_sockfd);
+				continue;
+			}
+			memset(client, 0, sizeof(*client));
+			client->num = (int)client_id;
 			client->thid = client_thid;
 			client->ctrl_sockfd = client_sockfd;
+			client->data_sockfd = -1;
+			client->pasv_sockfd = -1;
 			client->data_con_type = FTP_DATA_CONNECTION_NONE;
 			strcpy(client->cur_path, FTP_DEFAULT_PATH);
 			memcpy(&client->addr, &clientaddr, sizeof(client->addr));
@@ -1149,16 +1315,33 @@ static int server_thread(SceSize args, void *argp)
 			client_list_add(client);
 
 			/* Start the client thread */
-			sceKernelStartThread(client_thid, sizeof(client), &client);
+			ret = sceKernelStartThread(client_thid, sizeof(client), &client);
+			if (ret < 0) {
+				client_list_delete(client);
+				sceKernelDeleteThread(client_thid);
+				sceNetSocketClose(client_sockfd);
+				free(client);
+			}
 		} else {
-			/* if sceNetAccept returns < 0, it means that the listening
-			 * socket has been closed, this means that we want to
-			 * finish the server thread */
-			DEBUG("Server socket closed, 0x%08X\n", client_sockfd);
-			break;
+			if (server_stopping) {
+				DEBUG("Server socket closed, 0x%08X\n", client_sockfd);
+				break;
+			}
+
+			/* Resource pressure and interrupted calls can fail accept
+			 * transiently. Keep serving once the condition clears. */
+			INFO("Server accept error: 0x%08X; retrying.\n", client_sockfd);
+			sceKernelDelayThread(100 * 1000);
 		}
 	}
 
+	goto exit;
+
+close_and_exit:
+	sceNetSocketClose(server_sockfd);
+	server_sockfd = -1;
+
+exit:
 	DEBUG("Server thread exiting!\n");
 
 	sceKernelExitDeleteThread(0);
@@ -1235,6 +1418,7 @@ int ftpvita_init(char *vita_ip, unsigned short int *vita_port)
 	}
 
 	/* Start the server thread */
+	server_stopping = 0;
 	sceKernelStartThread(server_thid, 0, NULL);
 
 	ftp_initialized = 1;
@@ -1266,6 +1450,7 @@ void ftpvita_fini()
 		/* In order to "stop" the blocking sceNetAccept,
 		 * we have to close the server socket; this way
 		 * the accept call will return an error */
+		server_stopping = 1;
 		sceNetSocketClose(server_sockfd);
 
 		/* Wait until the server threads ends */
