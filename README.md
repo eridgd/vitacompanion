@@ -13,6 +13,17 @@ cmake ..
 make
 ```
 
+For a side-by-side test build that does not replace the canonical
+`1337`/`1338` service, configure distinct ports and a distinct module name:
+
+```bash
+cmake .. \
+  -DVITACOMPANION_FTP_PORT=1340 \
+  -DVITACOMPANION_CMD_PORT=1341 \
+  -DVITACOMPANION_MODULE_NAME=vitacompanion_test
+make
+```
+
 # Install
 
 Run VitaShell on your PS Vita, press SELECT to activate the FTP server and copy `vitacompanion.suprx` to `ur0:/tai`. Finally, add the following line to `ur0:/tai/config.txt`:
@@ -28,17 +39,19 @@ ur0:tai/vitacompanion.suprx
 
 You can upload stuff to your vita by running:
 ```
-curl -T somefile.zip ftp://IP_TO_VITA:1337/ux0:/somedir/somefile.zip
+curl -q -T somefile.zip ftp://IP_TO_VITA:1337/ux0:/somedir/somefile.zip
 ```
 Or you can use your regular FTP client. The server accepts both Vita-style
 paths such as `ux0:/somedir/` and FTP absolute paths such as `/ux0:/somedir/`.
-It also supports `EPSV`, `PASV`, `LIST`, `NLST`, and `MDTM` for compatibility with
-generic FTP clients.
+It supports passive mode with `PASV`/`EPSV`, unrestricted IPv4 active mode
+with `PORT`/`EPRT`, modern and traditional directory listings, ASCII and binary
+transfers, file metadata, and transfer restart/append commands for compatibility
+with generic FTP clients.
 
 If you want curl to send the full FTP path directly instead of changing
 directories first, use the double-slash URL form:
 ```
-curl --ftp-method nocwd ftp://IP_TO_VITA:1337//ux0:/somedir/
+curl -q --ftp-method nocwd ftp://IP_TO_VITA:1337//ux0:/somedir/
 ```
 
 ## Command server

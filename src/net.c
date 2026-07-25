@@ -6,24 +6,56 @@
 #include <ftpvita.h>
 #include <vitasdk.h>
 
-extern int run;
+#define NET_CTL_ERROR_NOT_TERMINATED ((int)0x80412102)
 
-int all_is_up;
-int net_connected;
+extern volatile int run;
 
-SceUID net_thid;
-static int netctl_cb_id;
+volatile int all_is_up;
+volatile int net_connected;
 
-void net_start()
+SceUID net_thid = -1;
+static int netctl_cb_id = -1;
+static int netctl_initialized;
+
+int net_start()
 {
+    int result;
+
     net_thid = sceKernelCreateThread("vitacompanion_net_thread", net_thread, 0x40, 0x10000, 0, 0, NULL);
-    sceKernelStartThread(net_thid, 0, NULL);
+    if (net_thid < 0)
+        return net_thid;
+
+    result = sceKernelStartThread(net_thid, 0, NULL);
+    if (result < 0)
+    {
+        sceKernelDeleteThread(net_thid);
+        net_thid = -1;
+        return result;
+    }
+
+    return 0;
 }
 
 void net_end()
 {
-    sceNetCtlInetUnregisterCallback(netctl_cb_id);
-    ftpvita_fini();
+    if (netctl_cb_id >= 0)
+    {
+        sceNetCtlInetUnregisterCallback(netctl_cb_id);
+        netctl_cb_id = -1;
+    }
+
+    if (all_is_up)
+    {
+        cmd_end();
+        ftpvita_fini();
+        all_is_up = 0;
+    }
+
+    if (netctl_initialized)
+    {
+        sceNetCtlTerm();
+        netctl_initialized = 0;
+    }
 }
 
 static void do_net_connected()
@@ -49,25 +81,40 @@ static void do_net_connected()
         ftpvita_add_device("xmc0:");
         ftpvita_add_device("grw0:");
 
-        cmd_start();
-        all_is_up = 1;
+        if (cmd_start() >= 0)
+        {
+            all_is_up = 1;
+        }
+        else
+        {
+            ftpvita_fini();
+        }
     }
 }
 
 static void netctl_cb(int event_type, void* arg)
 {
+    int state;
+    int result;
+
     LOG("netctl cb: %d\n", event_type);
+    (void)arg;
 
-    // TODO sceNetCtlInetGetResult
+    result = sceNetCtlInetGetState(&state);
+    if (result < 0)
+    {
+        LOG("sceNetCtlInetGetState: 0x%08X\n", result);
+        return;
+    }
 
-    if ((event_type == 1 || event_type == 2) && all_is_up == 1)
+    if (state != 3 && all_is_up)
     {
         net_connected = 0;
-        ftpvita_fini();
         cmd_end();
+        ftpvita_fini();
         all_is_up = 0;
     }
-    else if (event_type == 3 && !all_is_up)
+    else if (state == 3 && !all_is_up)
     { /* IP obtained */
         net_connected = 1;
         do_net_connected();
@@ -78,22 +125,25 @@ int net_thread(unsigned int args, void* argp)
 {
     int ret;
 
+    (void)args;
+    (void)argp;
+
     sceKernelDelayThread(3 * 1000 * 1000);
+    if (!run)
+        return 0;
 
     ret = sceNetCtlInit();
     LOG("sceNetCtlInit: 0x%08X\n", ret);
-
-    // If already connected to Wifi
-    int state;
-    sceNetCtlInetGetState(&state);
-    LOG("sceNetCtlInetGetState: 0x%08X\n", state);
-    netctl_cb(state, NULL);
-
-    // FIXME: Add a mutex here, network status might change right before the callback is registered
+    if (ret < 0 && ret != NET_CTL_ERROR_NOT_TERMINATED)
+        return ret;
+    netctl_initialized = ret == 0;
 
     ret = sceNetCtlInetRegisterCallback(netctl_cb, NULL, &netctl_cb_id);
     LOG("sceNetCtlInetRegisterCallback: 0x%08X\n", ret);
+    if (ret < 0)
+        return ret;
 
+    netctl_cb(0, NULL);
     while (run)
     {
         sceNetCtlCheckCallback();

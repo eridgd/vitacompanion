@@ -1,6 +1,8 @@
 #include "log.h"
 #include "main.h"
 
+#include <stddef.h>
+
 void LOG(const char *str, ...)
 {
 #if ENABLE_LOGGING == 1
@@ -14,6 +16,12 @@ void LOG(const char *str, ...)
 	va_start(arglist, str);
 	int len = vsnprintf(buff, sizeof(buff), str, arglist);
 	va_end(arglist);
-	sceIoWrite(logfd, buff, len);
+	if (len > 0) {
+		if ((size_t)len >= sizeof(buff))
+			len = (int)sizeof(buff) - 1;
+		sceIoWrite(logfd, buff, len);
+	}
+#else
+	(void)str;
 #endif
 }

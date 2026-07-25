@@ -12,6 +12,21 @@ endif()
 project(vitacompanion)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
+set(VITACOMPANION_FTP_PORT 1337 CACHE STRING "FTP control port")
+set(VITACOMPANION_CMD_PORT 1338 CACHE STRING "Command server port")
+set(VITACOMPANION_MODULE_NAME "vitacompanion" CACHE STRING "Vita module name")
+
+if(NOT VITACOMPANION_FTP_PORT MATCHES "^[0-9]+$" OR
+   VITACOMPANION_FTP_PORT LESS 1 OR VITACOMPANION_FTP_PORT GREATER 65535)
+  message(FATAL_ERROR "VITACOMPANION_FTP_PORT must be between 1 and 65535")
+endif()
+if(NOT VITACOMPANION_CMD_PORT MATCHES "^[0-9]+$" OR
+   VITACOMPANION_CMD_PORT LESS 1 OR VITACOMPANION_CMD_PORT GREATER 65535)
+  message(FATAL_ERROR "VITACOMPANION_CMD_PORT must be between 1 and 65535")
+endif()
+if(NOT VITACOMPANION_MODULE_NAME MATCHES "^[A-Za-z0-9_]+$")
+  message(FATAL_ERROR "VITACOMPANION_MODULE_NAME must contain only letters, digits, and underscores")
+endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -fno-pic -fno-PIC -std=gnu99")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fno-rtti -fno-exceptions")
@@ -30,7 +45,9 @@ add_library(ftpvita STATIC
         vendor/libftpvita/ftpvita_io.c
         vendor/libftpvita/ftpvita_io.h
         vendor/libftpvita/ftpvita_path.c
-        vendor/libftpvita/ftpvita_path.h)
+        vendor/libftpvita/ftpvita_path.h
+        vendor/libftpvita/ftpvita_protocol.c
+        vendor/libftpvita/ftpvita_protocol.h)
 
 add_executable(vitacompanion
         src/main.c
@@ -48,6 +65,12 @@ add_executable(vitacompanion
         src/cmd_definitions.c
         src/cmd_definitions.h)
 
+target_compile_definitions(ftpvita PRIVATE
+  FTP_PORT=${VITACOMPANION_FTP_PORT}
+)
+target_compile_definitions(vitacompanion PRIVATE
+  CMD_PORT=${VITACOMPANION_CMD_PORT}
+)
 
 target_link_libraries(vitacompanion
   taipool
@@ -71,7 +94,15 @@ set_target_properties(vitacompanion
   PROPERTIES LINK_FLAGS "-nostdlib"
 )
 
-vita_create_self(vitacompanion.suprx vitacompanion
+file(READ "${CMAKE_SOURCE_DIR}/vitacompanion.yml" VITACOMPANION_EXPORTS)
+string(REGEX REPLACE "^vitacompanion:"
+  "${VITACOMPANION_MODULE_NAME}:"
+  VITACOMPANION_EXPORTS "${VITACOMPANION_EXPORTS}")
+set(VITACOMPANION_EXPORTS_FILE
+  "${CMAKE_CURRENT_BINARY_DIR}/${VITACOMPANION_MODULE_NAME}.yml")
+file(WRITE "${VITACOMPANION_EXPORTS_FILE}" "${VITACOMPANION_EXPORTS}")
+
+vita_create_self(${VITACOMPANION_MODULE_NAME}.suprx vitacompanion
   UNSAFE
-  CONFIG ${CMAKE_SOURCE_DIR}/vitacompanion.yml
+  CONFIG ${VITACOMPANION_EXPORTS_FILE}
 )

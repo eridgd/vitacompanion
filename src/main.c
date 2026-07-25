@@ -13,39 +13,58 @@
 #include <taipool.h>
 
 extern SceUID net_thid;
-extern int all_is_up;
-extern int net_connected;
+extern volatile int all_is_up;
+extern volatile int net_connected;
 
-int run;
+volatile int run;
 
 void __unused _start() __attribute__((weak, alias("module_start")));
 int __unused module_start(SceSize argc, const void* args)
 {
+    int result;
+
+    (void)argc;
+    (void)args;
+
     // Required for ftpvita
-    taipool_init(1 * 1024 * 1024);
+    result = taipool_init(1 * 1024 * 1024);
+    if (result < 0)
+        return result;
 
 #if ENABLE_LOGGING == 1
     SceUID fd = sceIoOpen("ux0:dump/vitacompanion_log.txt", SCE_O_TRUNC | SCE_O_CREAT | SCE_O_WRONLY, 0666);
     sceIoClose(fd);
 #endif
     run = 1;
-    nosleep_start();
-    net_start();
+    result = nosleep_start();
+    if (result < 0)
+    {
+        run = 0;
+        taipool_term();
+        return result;
+    }
+    result = net_start();
+    if (result < 0)
+    {
+        run = 0;
+        nosleep_end();
+        taipool_term();
+        return result;
+    }
 
     return SCE_KERNEL_START_SUCCESS;
 }
 
 int __unused module_stop(SceSize argc, const void* args)
 {
+    (void)argc;
+    (void)args;
+
     run = 0;
-    nosleep_end();
     sceKernelWaitThreadEnd(net_thid, NULL, NULL);
 
-    if (all_is_up)
-    {
-        net_end();
-        cmd_end();
-    }
+    net_end();
+    nosleep_end();
 
     taipool_term();
 

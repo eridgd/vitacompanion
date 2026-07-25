@@ -5,6 +5,7 @@
 #ifndef FTPVITA_H
 #define FTPVITA_H
 
+#include <stddef.h>
 #include <psp2/types.h>
 #include <sys/syslimits.h>
 #include <psp2/net/net.h>
@@ -32,6 +33,13 @@ typedef enum {
 	FTP_DATA_CONNECTION_PASSIVE,
 } DataConnectionType;
 
+typedef enum {
+	FTP_TRANSFER_TYPE_ASCII,
+	FTP_TRANSFER_TYPE_IMAGE,
+} TransferType;
+
+#define FTPVITA_COMMAND_LINE_MAX 1024
+
 typedef struct ftpvita_client_info {
 	/* Client number */
 	int num;
@@ -50,9 +58,12 @@ typedef struct ftpvita_client_info {
 	SceNetSockaddrIn addr;
 	/* Receive buffer attributes */
 	int n_recv;
-	char recv_buffer[512];
+	char recv_buffer[FTPVITA_COMMAND_LINE_MAX];
+	size_t recv_buffer_used;
+	int recv_buffer_discarding;
 	/* Points to the character after the first space */
 	const char *recv_cmd_args;
+	int ctrl_send_failed;
 	/* Current working directory */
 	char cur_path[PATH_MAX];
 	/* Rename path */
@@ -64,6 +75,8 @@ typedef struct ftpvita_client_info {
 	int cleanup_by_server;
 	/* Offset for transfer resume */
 	unsigned int restore_point;
+	TransferType transfer_type;
+	int epsv_all;
 } ftpvita_client_info_t;
 
 

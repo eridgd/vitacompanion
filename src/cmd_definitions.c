@@ -7,6 +7,7 @@
 #include <vitasdk.h>
 
 #define COUNT_OF(arr) (sizeof(arr) / sizeof(arr[0]))
+#define CMD_RESPONSE_MAX 2048
 
 const cmd_definition cmd_definitions[] = {
     {.name = "help", .description = "Display this help screen", .arg_count = 0, .executor = &cmd_help},
@@ -29,25 +30,30 @@ const cmd_definition *cmd_get_definition(char *cmd_name) {
 }
 
 void cmd_help(char **arg_list, size_t arg_count, char *res_msg) {
-  char buf[2000] = {0};
   int longest_cmd = 0;
+  size_t used = 0;
 
-  for (int i = 0; i < COUNT_OF(cmd_definitions); ++i) {
-    int cmd_length = strlen(cmd_definitions[i].name);
+  for (size_t i = 0; i < COUNT_OF(cmd_definitions); ++i) {
+    int cmd_length = (int)strlen(cmd_definitions[i].name);
 
     if (cmd_length > longest_cmd) {
       longest_cmd = cmd_length;
     }
   }
 
-  sprintf(buf, "%-*s\t\t%s\n", longest_cmd, "Command", "Description");
-  strcpy(res_msg, buf);
+  used = (size_t)snprintf(res_msg, CMD_RESPONSE_MAX, "%-*s\t\t%s\n",
+    longest_cmd, "Command", "Description");
+  if (used >= CMD_RESPONSE_MAX)
+    return;
 
-  for (int i = 0; i < COUNT_OF(cmd_definitions); ++i) {
-    sprintf(buf, "%-*s\t\t%s\n", longest_cmd, cmd_definitions[i].name, cmd_definitions[i].description);
-    strcat(res_msg, buf);
+  for (size_t i = 0; i < COUNT_OF(cmd_definitions); ++i) {
+    int written = snprintf(res_msg + used, CMD_RESPONSE_MAX - used,
+      "%-*s\t\t%s\n", longest_cmd, cmd_definitions[i].name,
+      cmd_definitions[i].description);
+    if (written < 0 || (size_t)written >= CMD_RESPONSE_MAX - used)
+      return;
+    used += (size_t)written;
   }
-
 }
 
 

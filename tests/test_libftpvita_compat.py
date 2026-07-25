@@ -1,4 +1,5 @@
 import pathlib
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -9,7 +10,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 VENDOR = ROOT / "vendor" / "libftpvita"
 
 
-def compile_and_run(source, support_sources=("ftpvita_path.c",)):
+def compile_and_run(
+    source,
+    support_sources=("ftpvita_path.c",),
+    source_root=VENDOR,
+    include_root=VENDOR,
+):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
         source_path = tmp / "test.c"
@@ -23,9 +29,9 @@ def compile_and_run(source, support_sources=("ftpvita_path.c",)):
                 "-Wextra",
                 "-Werror",
                 "-I",
-                str(VENDOR),
+                str(include_root),
                 str(source_path),
-                *(str(VENDOR / name) for name in support_sources),
+                *(str(source_root / name) for name in support_sources),
                 "-o",
                 str(exe_path),
             ],
@@ -36,6 +42,42 @@ def compile_and_run(source, support_sources=("ftpvita_path.c",)):
 
 
 class LibftpvitaCompatTests(unittest.TestCase):
+    def test_command_server_accepts_lf_and_windows_crlf(self):
+        compile_and_run(
+            r"""
+            #include "parser.h"
+
+            #include <stdlib.h>
+            #include <string.h>
+
+            static void expect_command(char *input, size_t input_size,
+                size_t expected_count, const char *first, const char *second)
+            {
+                char *args[4] = {0};
+                size_t count = parse_cmd(input, input_size, args, 4);
+
+                if (count != expected_count || strcmp(args[0], first) != 0)
+                    exit(1);
+                if (second && strcmp(args[1], second) != 0)
+                    exit(2);
+            }
+
+            int main(void)
+            {
+                char lf[] = "reboot\n";
+                char crlf[] = "launch TEST00001\r\n";
+
+                expect_command(lf, sizeof(lf) - 1, 1, "reboot", NULL);
+                expect_command(crlf, sizeof(crlf) - 1, 2,
+                    "launch", "TEST00001");
+                return 0;
+            }
+            """,
+            support_sources=("parser.c",),
+            source_root=ROOT / "src",
+            include_root=ROOT / "src",
+        )
+
     def test_vita_paths_are_normalized_for_file_commands(self):
         compile_and_run(
             r"""
@@ -185,11 +227,204 @@ class LibftpvitaCompatTests(unittest.TestCase):
             """
         )
 
+    def test_active_mode_parsers_accept_valid_port_and_ipv4_eprt(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_protocol.h"
+
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+
+            int main(void)
+            {
+                unsigned char ip[4];
+                unsigned short port;
+                unsigned int protocol;
+                char address[64];
+
+                if (!ftpvita_parse_port("192,168,1,44,195,80", ip, &port))
+                    return 1;
+                if (ip[0] != 192 || ip[1] != 168 || ip[2] != 1 ||
+                    ip[3] != 44 || port != 50000)
+                    return 2;
+                if (!ftpvita_parse_eprt("|1|10.0.0.7|49152|", &protocol,
+                    address, sizeof(address), &port))
+                    return 3;
+                if (protocol != 1 || strcmp(address, "10.0.0.7") != 0 ||
+                    port != 49152)
+                    return 4;
+
+                if (ftpvita_parse_port("192,168,1,300,1,1", ip, &port))
+                    return 5;
+                if (ftpvita_parse_port("192,168,1,2,0,0", ip, &port))
+                    return 6;
+                if (ftpvita_parse_port("192,168,1,2,1", ip, &port))
+                    return 7;
+                if (ftpvita_parse_port("192,168,1,2,1,2,3", ip, &port))
+                    return 8;
+                if (ftpvita_parse_eprt("|1|10.0.0.7|0|", &protocol,
+                    address, sizeof(address), &port))
+                    return 9;
+                if (ftpvita_parse_eprt("|1|10.0.0.7|70000|", &protocol,
+                    address, sizeof(address), &port))
+                    return 10;
+                return 0;
+            }
+            """,
+            support_sources=("ftpvita_protocol.c",),
+        )
+
+    def test_epsv_and_type_parameter_parsers_are_bounded(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_protocol.h"
+
+            #include <stdlib.h>
+
+            int main(void)
+            {
+                ftpvita_epsv_request_t request;
+                unsigned int unsupported = 0;
+                char type;
+
+                if (!ftpvita_parse_epsv("", &request, &unsupported) ||
+                    request != FTPVITA_EPSV_DEFAULT)
+                    return 1;
+                if (!ftpvita_parse_epsv("1", &request, &unsupported) ||
+                    request != FTPVITA_EPSV_IPV4)
+                    return 2;
+                if (!ftpvita_parse_epsv("all", &request, &unsupported) ||
+                    request != FTPVITA_EPSV_ALL)
+                    return 3;
+                if (ftpvita_parse_epsv("2", &request, &unsupported) != -1 ||
+                    unsupported != 2)
+                    return 4;
+
+                if (!ftpvita_parse_type("a n", &type) || type != 'A')
+                    return 5;
+                if (!ftpvita_parse_type("i", &type) || type != 'I')
+                    return 6;
+                if (ftpvita_parse_type("A THIS_ARGUMENT_IS_TOO_LONG", &type))
+                    return 7;
+                if (ftpvita_parse_type("L 8", &type))
+                    return 8;
+                return 0;
+            }
+            """,
+            support_sources=("ftpvita_protocol.c",),
+        )
+
+    def test_u64_size_formatting_avoids_variadic_hardfp_mismatch(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_protocol.h"
+
+            #include <limits.h>
+            #include <stdlib.h>
+            #include <string.h>
+
+            static void expect_value(unsigned long long value,
+                const char *expected)
+            {
+                char actual[21];
+                if (!ftpvita_format_u64_decimal(actual, sizeof(actual), value))
+                    exit(1);
+                if (strcmp(actual, expected) != 0)
+                    exit(2);
+            }
+
+            int main(void)
+            {
+                char too_small[3];
+
+                expect_value(0, "0");
+                expect_value(1182, "1182");
+                expect_value(4294967296ULL, "4294967296");
+                expect_value(ULLONG_MAX, "18446744073709551615");
+                if (ftpvita_format_u64_decimal(too_small,
+                    sizeof(too_small), 100))
+                    return 3;
+                if (too_small[0] != '\0')
+                    return 4;
+                return 0;
+            }
+            """,
+            support_sources=("ftpvita_protocol.c",),
+        )
+
+    def test_ascii_transfer_conversion_handles_split_crlf_sequences(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_protocol.h"
+
+            #include <stdlib.h>
+            #include <string.h>
+
+            int main(void)
+            {
+                static const unsigned char local[] = "a\nb\nc\rd";
+                static const unsigned char wire[] = "a\r\nb\r\nc\r\0d";
+                unsigned char encoded[64];
+                unsigned char decoded[64];
+                ftpvita_ascii_state_t state;
+                size_t used = 0;
+                size_t amount;
+
+                ftpvita_ascii_state_init(&state);
+                amount = ftpvita_ascii_encode(&state, local, 4,
+                    encoded + used, sizeof(encoded) - used);
+                if (amount == (size_t)-1)
+                    return 1;
+                used += amount;
+                amount = ftpvita_ascii_encode(&state, local + 4,
+                    sizeof(local) - 1 - 4, encoded + used,
+                    sizeof(encoded) - used);
+                if (amount == (size_t)-1)
+                    return 2;
+                used += amount;
+                amount = ftpvita_ascii_finish_encode(&state, encoded + used,
+                    sizeof(encoded) - used);
+                if (amount == (size_t)-1)
+                    return 3;
+                used += amount;
+                if (used != sizeof(wire) - 1 ||
+                    memcmp(encoded, wire, used) != 0)
+                    return 4;
+
+                ftpvita_ascii_state_init(&state);
+                used = ftpvita_ascii_decode(&state, wire, 2,
+                    decoded, sizeof(decoded));
+                if (used == (size_t)-1)
+                    return 5;
+                amount = ftpvita_ascii_decode(&state, wire + 2,
+                    sizeof(wire) - 1 - 2, decoded + used,
+                    sizeof(decoded) - used);
+                if (amount == (size_t)-1)
+                    return 6;
+                used += amount;
+                amount = ftpvita_ascii_finish_decode(&state, decoded + used,
+                    sizeof(decoded) - used);
+                if (amount == (size_t)-1)
+                    return 7;
+                used += amount;
+                if (used != sizeof(local) - 1 ||
+                    memcmp(decoded, local, used) != 0)
+                    return 8;
+                return 0;
+            }
+            """,
+            support_sources=("ftpvita_protocol.c",),
+        )
+
     def test_ftp_command_table_wires_compatibility_commands(self):
         source = (VENDOR / "ftpvita.c").read_text()
         self.assertIn("ftpvita_path_from_list_args", source)
         self.assertIn("add_entry(EPSV)", source)
+        self.assertIn("add_entry(EPRT)", source)
         self.assertIn("add_entry(NLST)", source)
+        self.assertIn("add_entry(MLST)", source)
+        self.assertIn("add_entry(MLSD)", source)
         self.assertIn("add_entry(MDTM)", source)
 
     def test_commands_without_argument_separator_have_empty_args(self):
@@ -258,9 +493,12 @@ class LibftpvitaCompatTests(unittest.TestCase):
         source = (VENDOR / "ftpvita.c").read_text()
         self.assertIn("SCE_NET_SO_SNDTIMEO", source)
         self.assertIn("SCE_NET_SO_RCVTIMEO", source)
+        self.assertIn("SCE_NET_SO_LINGER", source)
         self.assertIn("client_send_data_msg(client, buffer) < 0", source)
-        self.assertIn('"%15s"', source)
-        self.assertIn("sizeof(client->recv_buffer) - 1", source)
+        self.assertIn("client_consume_received_data", source)
+        self.assertIn("recv_buffer_discarding", source)
+        self.assertIn("Command line is too long.", source)
+        self.assertIn("MAX_CLIENTS", source)
         self.assertIn("if (server_stopping)", source)
         self.assertIn("Server accept error:", source)
 
@@ -271,6 +509,88 @@ class LibftpvitaCompatTests(unittest.TestCase):
             shutdown.index("sceKernelUnlockMutex(client_list_mtx, 1)"),
             shutdown.index("sceKernelWaitThreadEnd(it->thid"),
         )
+
+    def test_active_mode_replaces_prior_data_connection_and_remains_unrestricted(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        active_start = source.index("static int client_prepare_active_data_connection")
+        active_end = source.index("static void cmd_PORT_func", active_start)
+        active = source[active_start:active_end]
+        self.assertIn("client_close_data_connection(client)", active)
+        self.assertIn("client->data_sockaddr.sin_addr = *data_addr;", active)
+        self.assertNotIn("client->addr", active)
+
+        port_start = source.index("static void cmd_PORT_func")
+        port_end = source.index("static void cmd_EPRT_func", port_start)
+        port_handler = source[port_start:port_end]
+        self.assertIn("ftpvita_parse_port", port_handler)
+        self.assertNotIn("sscanf", port_handler)
+        self.assertNotIn("sprintf", port_handler)
+
+    def test_ftp_listener_waits_for_readiness_and_bounds_clients(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        init_start = source.index("int ftpvita_init")
+        init_end = source.index("void ftpvita_fini", init_start)
+        init = source[init_start:init_end]
+        self.assertIn("server_start_state", init)
+        self.assertIn("SERVER_START_TIMEOUT_MS", init)
+        self.assertIn("if (server_start_state != 1)", init)
+        self.assertIn("if (number_clients < MAX_CLIENTS)", source)
+        self.assertIn('"421 Too many FTP clients."', source)
+
+    def test_test_ports_are_build_time_overrides_with_canonical_defaults(self):
+        cmake = (ROOT / "CMakeLists.txt").read_text()
+        ftp_source = (VENDOR / "ftpvita.c").read_text()
+        cmd_source = (ROOT / "src" / "cmd.c").read_text()
+
+        self.assertIn("VITACOMPANION_FTP_PORT 1337", cmake)
+        self.assertIn("VITACOMPANION_CMD_PORT 1338", cmake)
+        self.assertIn("VITACOMPANION_MODULE_NAME", cmake)
+        self.assertIn("FTP_PORT=${VITACOMPANION_FTP_PORT}", cmake)
+        self.assertIn("CMD_PORT=${VITACOMPANION_CMD_PORT}", cmake)
+        self.assertIn("#ifndef FTP_PORT", ftp_source)
+        self.assertIn("#ifndef CMD_PORT", cmd_source)
+
+    def test_control_parser_handles_stream_framing_and_case_insensitive_commands(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        consume_start = source.index("static int client_consume_received_data")
+        consume_end = source.index("static int client_thread", consume_start)
+        consume = source[consume_start:consume_end]
+        self.assertIn("client->recv_buffer_used", consume)
+        self.assertIn("if (value == '\\n')", consume)
+        self.assertIn("client_handle_command_line", consume)
+
+        line_start = source.index("static int client_handle_command_line")
+        line_end = source.index("static int client_consume_received_data", line_start)
+        line_handler = source[line_start:line_end]
+        self.assertIn("cursor[cmd_length] - ('a' - 'A')", line_handler)
+        self.assertIn("args_length >= 4", source)
+
+    def test_command_service_tracks_and_aborts_the_accepted_socket(self):
+        source = (ROOT / "src" / "cmd.c").read_text()
+        self.assertIn("loader_client_sockfd", source)
+        self.assertIn("loader_start_state", source)
+        self.assertIn("SCE_NET_SO_RCVTIMEO", source)
+        shutdown_start = source.index("void cmd_end()")
+        shutdown = source[shutdown_start:]
+        self.assertLess(
+            shutdown.index("sceNetSocketAbort(loader_client_sockfd"),
+            shutdown.index("sceKernelWaitThreadEnd(loader_thid"),
+        )
+
+    def test_network_teardown_stops_command_service_before_ftp_network_term(self):
+        source = (ROOT / "src" / "net.c").read_text()
+        shutdown_start = source.index("void net_end()")
+        shutdown_end = source.index("static void do_net_connected", shutdown_start)
+        shutdown = source[shutdown_start:shutdown_end]
+        self.assertLess(shutdown.index("cmd_end();"), shutdown.index("ftpvita_fini();"))
+
+    def test_requested_destructive_upload_semantics_remain_unchanged(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        receive_start = source.index("static void receive_file")
+        receive_end = source.index("static void cmd_STOR_func", receive_start)
+        receive = source[receive_start:receive_end]
+        self.assertIn("mode |= SCE_O_TRUNC;", receive)
+        self.assertIn("sceIoRemove(path);", receive)
 
     def test_client_allocation_is_not_folded_into_taipool_calloc(self):
         source = (VENDOR / "ftpvita.c").read_text()
@@ -300,6 +620,27 @@ class LibftpvitaCompatTests(unittest.TestCase):
         rest_handler = source[rest_start:rest_end]
         self.assertIn("ftpvita_parse_restart_offset", rest_handler)
         self.assertNotIn("sscanf", rest_handler)
+
+    def test_taipool_cleanup_never_frees_a_null_pointer(self):
+        ftp_source = (VENDOR / "ftpvita.c").read_text()
+        main_source = (ROOT / "src" / "main.c").read_text()
+
+        safe_free_start = ftp_source.index("static void free_allocated")
+        safe_free_end = ftp_source.index("static void log_func", safe_free_start)
+        safe_free = ftp_source[safe_free_start:safe_free_end]
+        self.assertIn("if (ptr)", safe_free)
+
+        without_safe_free = ftp_source[:safe_free_start] + ftp_source[safe_free_end:]
+        self.assertIsNone(re.search(r"(?m)^[ \t]*free\(", without_safe_free))
+        self.assertIn("result = taipool_init", main_source)
+        self.assertIn("if (result < 0)", main_source)
+
+    def test_public_extension_hooks_reject_null_inputs(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        self.assertIn("if (!devname)", source)
+        self.assertIn("if (!cmd || !func)", source)
+        self.assertIn("if (client && msg)", source)
+        self.assertIn("if (client && str)", source)
 
 
 if __name__ == "__main__":
