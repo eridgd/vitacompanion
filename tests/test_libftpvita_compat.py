@@ -143,6 +143,48 @@ class LibftpvitaCompatTests(unittest.TestCase):
             """
         )
 
+    def test_restart_offset_parser_accepts_valid_offsets_and_rejects_invalid_input(self):
+        compile_and_run(
+            r"""
+            #include "ftpvita_path.h"
+
+            #include <limits.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+
+            static void expect_valid(const char *input, unsigned int expected)
+            {
+                unsigned int actual = 123;
+                if (!ftpvita_parse_restart_offset(input, &actual) || actual != expected) {
+                    fprintf(stderr, "expected valid offset %u for %s, got %u\n",
+                        expected, input, actual);
+                    exit(1);
+                }
+            }
+
+            static void expect_invalid(const char *input)
+            {
+                unsigned int actual = 123;
+                if (ftpvita_parse_restart_offset(input, &actual)) {
+                    fprintf(stderr, "expected invalid offset for %s\n", input);
+                    exit(1);
+                }
+            }
+
+            int main(void)
+            {
+                expect_valid("0\r\n", 0);
+                expect_valid("  42 \r\n", 42);
+                expect_valid("2147483647\r\n", INT_MAX);
+                expect_invalid("");
+                expect_invalid("-1\r\n");
+                expect_invalid("12x\r\n");
+                expect_invalid("2147483648\r\n");
+                return 0;
+            }
+            """
+        )
+
     def test_ftp_command_table_wires_compatibility_commands(self):
         source = (VENDOR / "ftpvita.c").read_text()
         self.assertIn("ftpvita_path_from_list_args", source)
@@ -229,6 +271,35 @@ class LibftpvitaCompatTests(unittest.TestCase):
             shutdown.index("sceKernelUnlockMutex(client_list_mtx, 1)"),
             shutdown.index("sceKernelWaitThreadEnd(it->thid"),
         )
+
+    def test_client_allocation_is_not_folded_into_taipool_calloc(self):
+        source = (VENDOR / "ftpvita.c").read_text()
+        server_start = source.index("static int server_thread")
+        server_end = source.index("int ftpvita_init", server_start)
+        server = source[server_start:server_end]
+
+        allocation_start = server.index(
+            "ftpvita_client_info_t *client = malloc(sizeof(*client));"
+        )
+        initialization_start = server.index("client->num =", allocation_start)
+        allocation = server[allocation_start:initialization_start]
+
+        self.assertNotIn("memset(client, 0, sizeof(*client))", allocation)
+        self.assertNotIn("socket_set_io_timeouts(client_sockfd", server)
+        self.assertIn("client->data_sockaddr = (SceNetSockaddrIn){0};", server)
+        self.assertIn("client->pasv_sockaddr = (SceNetSockaddrIn){0};", server)
+        self.assertIn("client->n_recv = 0;", server)
+        self.assertIn("client->recv_buffer[0] = '\\0';", server)
+        self.assertIn('client->recv_cmd_args = "";', server)
+        self.assertIn("client->rename_path[0] = '\\0';", server)
+        self.assertIn("sceKernelStartThread(client_thid", server)
+        self.assertIn('"220 FTPVita Server ready."', source)
+
+        rest_start = source.index("static void cmd_REST_func")
+        rest_end = source.index("static void cmd_FEAT_func", rest_start)
+        rest_handler = source[rest_start:rest_end]
+        self.assertIn("ftpvita_parse_restart_offset", rest_handler)
+        self.assertNotIn("sscanf", rest_handler)
 
 
 if __name__ == "__main__":

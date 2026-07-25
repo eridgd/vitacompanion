@@ -30,7 +30,6 @@
 #define FTP_PORT 1337
 #define NET_INIT_SIZE (64 * 1024)
 #define DEFAULT_FILE_BUF_SIZE (4 * 1024 * 1024)
-#define CONTROL_SOCKET_TIMEOUT_US (30 * 1000 * 1000)
 #define DATA_SOCKET_TIMEOUT_US (15 * 1000 * 1000)
 
 #define FTP_DEFAULT_PATH   "/"
@@ -955,8 +954,13 @@ static void cmd_MDTM_func(ftpvita_client_info_t *client)
 static void cmd_REST_func(ftpvita_client_info_t *client)
 {
 	char cmd[64];
-	sscanf(client->recv_buffer, "%*[^ ] %d", &client->restore_point);
-	sprintf(cmd, "350 Resuming at %d" FTPVITA_EOL, client->restore_point);
+
+	if (!ftpvita_parse_restart_offset(client->recv_cmd_args, &client->restore_point)) {
+		client_send_ctrl_msg(client, "501 Invalid restart offset." FTPVITA_EOL);
+		return;
+	}
+
+	snprintf(cmd, sizeof(cmd), "350 Resuming at %u" FTPVITA_EOL, client->restore_point);
 	client_send_ctrl_msg(client, cmd);
 }
 
@@ -1266,7 +1270,6 @@ static int server_thread(SceSize args, void *argp)
 		client_sockfd = sceNetAccept(server_sockfd, (SceNetSockaddr *)&clientaddr, &addrlen);
 		if (client_sockfd >= 0) {
 			DEBUG("New connection, client fd: 0x%08X\n", client_sockfd);
-			socket_set_io_timeouts(client_sockfd, CONTROL_SOCKET_TIMEOUT_US);
 
 			/* Get the client's IP address */
 			char remote_ip[16];
@@ -1301,14 +1304,19 @@ static int server_thread(SceSize args, void *argp)
 				sceNetSocketClose(client_sockfd);
 				continue;
 			}
-			memset(client, 0, sizeof(*client));
 			client->num = (int)client_id;
 			client->thid = client_thid;
 			client->ctrl_sockfd = client_sockfd;
 			client->data_sockfd = -1;
-			client->pasv_sockfd = -1;
 			client->data_con_type = FTP_DATA_CONNECTION_NONE;
+			client->data_sockaddr = (SceNetSockaddrIn){0};
+			client->pasv_sockaddr = (SceNetSockaddrIn){0};
+			client->pasv_sockfd = -1;
+			client->n_recv = 0;
+			client->recv_buffer[0] = '\0';
+			client->recv_cmd_args = "";
 			strcpy(client->cur_path, FTP_DEFAULT_PATH);
+			client->rename_path[0] = '\0';
 			memcpy(&client->addr, &clientaddr, sizeof(client->addr));
 
 			/* Add the new client to the client list */

@@ -4,6 +4,7 @@
 
 #include "ftpvita_path.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -150,4 +151,36 @@ void ftpvita_format_mdtm_response(char *out, size_t out_size,
 {
 	snprintf(out, out_size, "213 %04d%02d%02d%02d%02d%02d" FTPVITA_EOL,
 		year, month, day, hour, minute, second);
+}
+
+int ftpvita_parse_restart_offset(const char *args, unsigned int *offset)
+{
+	unsigned int value = 0;
+	int have_digit = 0;
+
+	if (!args || !offset)
+		return 0;
+
+	while (*args && ascii_is_space(*args))
+		args++;
+
+	while (*args >= '0' && *args <= '9') {
+		unsigned int digit = (unsigned int)(*args - '0');
+
+		if (value > ((unsigned int)INT_MAX - digit) / 10)
+			return 0;
+
+		value = value * 10 + digit;
+		have_digit = 1;
+		args++;
+	}
+
+	while (*args && ascii_is_space(*args))
+		args++;
+
+	if (!have_digit || *args != '\0')
+		return 0;
+
+	*offset = value;
+	return 1;
 }

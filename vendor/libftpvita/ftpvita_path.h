@@ -12,5 +12,6 @@ void ftpvita_path_from_list_args(const char *cur_path, const char *args, char *o
 void ftpvita_format_epsv_response(char *out, size_t out_size, unsigned short port);
 void ftpvita_format_mdtm_response(char *out, size_t out_size,
 	int year, int month, int day, int hour, int minute, int second);
+int ftpvita_parse_restart_offset(const char *args, unsigned int *offset);
 
 #endif
