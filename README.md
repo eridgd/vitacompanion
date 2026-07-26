@@ -114,12 +114,14 @@ Supported button names are `select`, `start`, `up`, `right`, `down`, `left`,
 `l`, `r`, `l1`, `r1`, `l2`, `r2`, `l3`, `r3`, `triangle`, `circle`, `cross`
 (`x` is an alias), `square`, and `ps`.
 
-Analog-stick coordinates are integers from 0 through 255, with 128 as the
-center:
+Use `left-stick` or `right-stick` as the analog-stick target. Coordinates are
+integers from 0 through 255, with 128 as the center:
 
 ```
 press left-stick 0 128
 release left-stick
+press right-stick 255 128
+release right-stick
 ```
 
 Front and rear touches have four independently controlled slots, numbered 0
