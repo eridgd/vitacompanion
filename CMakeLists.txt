@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(DEFINED ENV{VITASDK})
@@ -32,6 +32,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -fno-pic -fno-PIC -std=gnu9
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fno-rtti -fno-exceptions")
 
 include_directories(
+  ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/vendor/libftpvita
 )
 
@@ -49,6 +50,31 @@ add_library(ftpvita STATIC
         vendor/libftpvita/ftpvita_protocol.c
         vendor/libftpvita/ftpvita_protocol.h)
 
+add_executable(vitacompanion_kernel
+        kernel/main.c)
+
+target_compile_definitions(vitacompanion_kernel PRIVATE
+  __VITA_KERNEL__
+)
+
+target_link_libraries(vitacompanion_kernel
+  taihenForKernel_stub
+  SceCtrlForDriver_stub
+  SceThreadmgrForDriver_stub
+  gcc
+)
+
+set_target_properties(vitacompanion_kernel
+  PROPERTIES LINK_FLAGS "-nostdlib"
+)
+
+vita_create_self(vitacompanion_kernel.skprx vitacompanion_kernel
+  CONFIG ${CMAKE_SOURCE_DIR}/kernel/vitacompanion_kernel.yml
+)
+vita_create_stubs(vitacompanion_kernel_stubs vitacompanion_kernel
+  ${CMAKE_SOURCE_DIR}/kernel/vitacompanion_kernel.yml KERNEL
+)
+
 add_executable(vitacompanion
         src/main.c
         src/main.h
@@ -62,6 +88,11 @@ add_executable(vitacompanion
         src/nosleep.h
         src/parser.c
         src/parser.h
+        src/input.c
+        src/input.h
+        src/input_parse.c
+        src/version.c
+        src/version.h
         src/cmd_definitions.c
         src/cmd_definitions.h)
 
@@ -72,9 +103,10 @@ target_compile_definitions(vitacompanion PRIVATE
   CMD_PORT=${VITACOMPANION_CMD_PORT}
 )
 
+add_dependencies(vitacompanion vitacompanion_kernel_stubs)
+
 target_link_libraries(vitacompanion
   taipool
-  taihen_stub
   ftpvita
   k
   gcc
@@ -86,8 +118,10 @@ target_link_libraries(vitacompanion
   SceIofilemgr_stub_weak
   SceRtc_stub_weak
   SceAppMgr_stub
+  SceKernelModulemgr_stub
   SceProcessmgr_stub_weak
   ScePower_stub
+  ${CMAKE_CURRENT_BINARY_DIR}/libvitacompanion_kernel_stub.a
 )
 
 set_target_properties(vitacompanion

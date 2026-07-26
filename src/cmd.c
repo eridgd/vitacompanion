@@ -15,7 +15,9 @@
 #error CMD_PORT must be between 1 and 65535
 #endif
 #define ARG_MAX (20)
-#define CMD_RES_MAX (2048)
+#define CMD_MAX (32)
+#define CMD_REQUEST_MAX (2048)
+#define CMD_RES_MAX (8192)
 #define CMD_IO_TIMEOUT_US (15 * 1000 * 1000)
 #define CMD_START_TIMEOUT_MS 5000
 
@@ -29,6 +31,12 @@ static int loader_sockfd = -1;
 static int loader_client_sockfd = -1;
 static volatile int loader_stopping;
 static volatile int loader_start_state;
+
+typedef struct {
+    const cmd_definition* definition;
+    char* args[ARG_MAX];
+    size_t arg_count;
+} parsed_command;
 
 static int cmd_send_all(int socket, const char* message)
 {
@@ -46,33 +54,109 @@ static int cmd_send_all(int socket, const char* message)
     return (int)sent;
 }
 
+static int cmd_receive_request(int socket, char* request,
+    unsigned int capacity)
+{
+    unsigned int used = 0;
+
+    while (used < capacity)
+    {
+        int received = sceNetRecv(
+            socket, request + used, capacity - used, 0);
+        unsigned int i;
+
+        if (received <= 0)
+            return used > 0 ? (int)used : received;
+
+        for (i = 0; i < (unsigned int)received; ++i)
+        {
+            if (request[used + i] == '\n' ||
+                request[used + i] == '\r')
+                return (int)(used + i + 1);
+        }
+
+        used += (unsigned int)received;
+    }
+
+    return (int)used;
+}
+
+static void response_append(char* response, const char* addition)
+{
+    size_t used = strlen(response);
+    size_t available;
+
+    if (used >= CMD_RES_MAX - 1)
+        return;
+
+    available = CMD_RES_MAX - used - 1;
+    strncat(response, addition, available);
+}
+
 void cmd_handle(char* cmd, unsigned int cmd_size, char* res_msg)
 {
-    char* arg_list[ARG_MAX] = { 0 };
+    char* command_strings[CMD_MAX] = {0};
+    parsed_command commands[CMD_MAX] = {0};
+    size_t command_count = 0;
+    size_t command_index;
 
-    size_t arg_count = parse_cmd(cmd, cmd_size, arg_list, ARG_MAX);
+    res_msg[0] = '\0';
+    if (!parse_cmd_chain(cmd, cmd_size, command_strings, CMD_MAX,
+        &command_count))
+    {
+        strcpy(res_msg, "Error: Too many chained commands.\n");
+        return;
+    }
 
-    if (arg_count == 0)
+    if (command_count == 0)
     {
         strcpy(res_msg, "Error: Empty command.\n");
         return;
     }
 
-    const cmd_definition* cmd_def = cmd_get_definition(arg_list[0]);
-
-    if (cmd_def == NULL)
+    for (command_index = 0; command_index < command_count; ++command_index)
     {
-        strcpy(res_msg, "Error: Unknown command.\n");
-        return;
+        parsed_command* parsed = &commands[command_index];
+
+        parsed->arg_count = parse_cmd(command_strings[command_index],
+            strlen(command_strings[command_index]), parsed->args, ARG_MAX);
+        if (parsed->arg_count == 0)
+        {
+            strcpy(res_msg, "Error: Empty command.\n");
+            return;
+        }
+
+        parsed->definition = cmd_get_definition(parsed->args[0]);
+        if (parsed->definition == NULL)
+        {
+            strcpy(res_msg, "Error: Unknown command.\n");
+            return;
+        }
+
+        if (parsed->arg_count - 1 <
+                parsed->definition->min_arg_count ||
+            parsed->arg_count - 1 >
+                parsed->definition->max_arg_count)
+        {
+            strcpy(res_msg, "Error: Incorrect number of arguments.\n");
+            return;
+        }
+
+        if (parsed->definition->validator &&
+            !parsed->definition->validator(parsed->args,
+                parsed->arg_count, res_msg))
+            return;
     }
 
-    if (cmd_def->arg_count != arg_count - 1)
+    for (command_index = 0; command_index < command_count; ++command_index)
     {
-        strcpy(res_msg, "Error: Incorrect number of arguments.\n");
-        return;
-    }
+        char command_response[2048] = {0};
+        parsed_command* parsed = &commands[command_index];
 
-    cmd_def->executor(arg_list, arg_count, res_msg);
+        parsed->definition->executor(
+            parsed->args, parsed->arg_count, command_response);
+        response_append(res_msg, command_response);
+    }
 }
 
 int cmd_thread(unsigned int args, void* argp)
@@ -110,7 +194,7 @@ int cmd_thread(unsigned int args, void* argp)
         if (client_sockfd >= 0)
         {
             int timeout_us = CMD_IO_TIMEOUT_US;
-            char cmd[100] = { 0 };
+            char cmd[CMD_REQUEST_MAX + 1] = { 0 };
             char res_msg[CMD_RES_MAX] = { 0 };
             int size;
 
@@ -129,12 +213,18 @@ int cmd_thread(unsigned int args, void* argp)
             loader_client_sockfd = client_sockfd;
             sceKernelUnlockMutex(loader_client_mtx, 1);
 
-            size = sceNetRecv(client_sockfd, cmd, sizeof(cmd) - 1, 0);
+            size = cmd_receive_request(
+                client_sockfd, cmd, CMD_REQUEST_MAX);
 
             if (size > 0)
             {
                 cmd[size] = '\0';
-                cmd_handle(cmd, (unsigned int)size, res_msg);
+                if (size == CMD_REQUEST_MAX &&
+                    cmd[size - 1] != '\n' &&
+                    cmd[size - 1] != '\r')
+                    strcpy(res_msg, "Error: Command request is too long.\n");
+                else
+                    cmd_handle(cmd, (unsigned int)size, res_msg);
             }
 
             if (res_msg[0] != '\0')

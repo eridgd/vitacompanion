@@ -3,9 +3,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <taihen.h>
 #define TAIPOOL_AS_STDLIB
 #include "cmd.h"
+#include "input.h"
 #include "main.h"
 #include "net.h"
 #include "nosleep.h"
@@ -26,10 +26,17 @@ int __unused module_start(SceSize argc, const void* args)
     (void)argc;
     (void)args;
 
+    result = input_start();
+    if (result < 0)
+        return result;
+
     // Required for ftpvita
     result = taipool_init(1 * 1024 * 1024);
     if (result < 0)
+    {
+        input_end();
         return result;
+    }
 
 #if ENABLE_LOGGING == 1
     SceUID fd = sceIoOpen("ux0:dump/vitacompanion_log.txt", SCE_O_TRUNC | SCE_O_CREAT | SCE_O_WRONLY, 0666);
@@ -49,6 +56,7 @@ int __unused module_start(SceSize argc, const void* args)
         run = 0;
         nosleep_end();
         taipool_term();
+        input_end();
         return result;
     }
 
@@ -65,6 +73,7 @@ int __unused module_stop(SceSize argc, const void* args)
 
     net_end();
     nosleep_end();
+    input_end();
 
     taipool_term();
 

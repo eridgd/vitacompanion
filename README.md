@@ -1,8 +1,10 @@
 # Vitacompanion
 
-Vitacompanion is a user module which makes developing homebrews for the PS Vita device easier. It does two things:
-- Open a FTP server on port 1337
-- Listen to commands on port 1338
+Vitacompanion is a user module which makes developing homebrews for the PS Vita device easier. It:
+
+- Opens a FTP server on port 1337
+- Listens to commands on port 1338
+- Simulates controller and touch input through a small kernel module
 
 # Build
 
@@ -26,12 +28,23 @@ make
 
 # Install
 
-Run VitaShell on your PS Vita, press SELECT to activate the FTP server and copy `vitacompanion.suprx` to `ur0:/tai`. Finally, add the following line to `ur0:/tai/config.txt`:
+Run VitaShell on your PS Vita, press SELECT to activate the FTP server and
+copy both `vitacompanion.suprx` and `vitacompanion_kernel.skprx` to
+`ur0:/tai`. Add the kernel module under `*KERNEL` and the user module under
+`*main` in `ur0:/tai/config.txt`:
 
 ```
+*KERNEL
+ur0:tai/vitacompanion_kernel.skprx
+
 *main
 ur0:tai/vitacompanion.suprx
 ```
+
+The two modules are loaded separately by taiHEN. The kernel module is required
+because the user module imports its input API; the user module does not load
+the kernel module itself. Reboot after replacing either module so older copies
+are not left resident in memory.
 
 # Usage
 
@@ -65,17 +78,63 @@ echo reboot | nc IP_TO_PSVITA 1338
 
 Note that you need to append a newline character to the command that you send. `echo` already adds one, which is why it works here.
 
+Multiple commands can be executed sequentially by separating them with
+semicolons. The final semicolon is optional:
+
+```
+echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
+```
+
 ### Available commands
 
-| Command   | Arguments               | Explanation                  |
-| --------- | ----------------------- | ---------------------------- |
-| `help`    | none                    | display the help screen      |
-| `destroy` | none                    | kill all running applications |
-| `launch`  | `<TITLEID>`             | launch an application by id e.g. `launch VHBB00001` to launch the [Vita Homebrew Browser](https://github.com/devnoname120/vhbb) |
-| `kill`    | `<TITLEID>`             | kill an application by id    |
-| `nosleep` | `on`, `off` or `status` | enable or disable automatic suspend prevention. This is enabled by default at boot |
-| `reboot`  | none                    | reboot the console           |
-| `screen`  | `on` or `off`           | turn screen on or off        |
+| Command   | Arguments                       | Explanation                  |
+| --------- | ------------------------------- | ---------------------------- |
+| `help`    | none                            | display the help screen      |
+| `destroy` | none                            | kill all running applications |
+| `launch`  | `<TITLEID>`                     | launch an application by id e.g. `launch VHBB00001` to launch the [Vita Homebrew Browser](https://github.com/devnoname120/vhbb) |
+| `kill`    | `<TITLEID>`                     | kill an application by id    |
+| `nosleep` | `on`, `off` or `status`         | enable or disable automatic suspend prevention. This is enabled by default at boot |
+| `press`   | input target and values         | press a button, position a stick, or start/update a touch |
+| `reboot`  | none                            | reboot the console           |
+| `release` | input target                    | release one input or all synthetic input |
+| `screen`  | `on` or `off`                   | turn screen on or off        |
+| `version` | none                            | display the loaded Vita Companion module version |
+| `wait`    | duration ending in `ms` or `s`  | wait before executing the next chained command |
+
+`wait` accepts integer durations such as `wait 1000ms` and `wait 3s`.
+
+Buttons use the following form:
+
+```
+press cross
+release cross
+```
+
+Supported button names are `select`, `start`, `up`, `right`, `down`, `left`,
+`l`, `r`, `l1`, `r1`, `l2`, `r2`, `l3`, `r3`, `triangle`, `circle`, `cross`
+(`x` is an alias), `square`, and `ps`.
+
+Analog-stick coordinates are integers from 0 through 255, with 128 as the
+center:
+
+```
+press left-stick 0 128
+release left-stick
+```
+
+Front and rear touches have four independently controlled slots, numbered 0
+through 3. Repeating `press` for an active slot moves that same touch while
+preserving its contact ID. Coordinates use the Vita's raw 1920 by 1088 touch
+space:
+
+```
+press front-touch 0 960 544
+release front-touch 0
+press rear-touch 1 400 300
+release rear-touch 1
+```
+
+Use `release all` to clear every synthetic button, stick, and touch.
  
  **Note**: Commands are defined in [`src/cmd_definitions.c`](https://github.com/robsdedude/vitacompanion/blob/master/src/cmd_definitions.c), you can add new commands there.
  

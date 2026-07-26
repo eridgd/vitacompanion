@@ -1,7 +1,11 @@
 #include "cmd_definitions.h"
+#include "input.h"
 #include "nosleep.h"
+#include "parser.h"
+#include "version.h"
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <vitasdk.h>
@@ -9,15 +13,29 @@
 #define COUNT_OF(arr) (sizeof(arr) / sizeof(arr[0]))
 #define CMD_RESPONSE_MAX 2048
 
+static bool validate_press(char **arg_list, size_t arg_count,
+    char *res_msg);
+static bool validate_release(char **arg_list, size_t arg_count,
+    char *res_msg);
+static bool validate_wait(char **arg_list, size_t arg_count,
+    char *res_msg);
+
 const cmd_definition cmd_definitions[] = {
-    {.name = "help", .description = "Display this help screen", .arg_count = 0, .executor = &cmd_help},
-    {.name = "destroy", .description = "Kill all running applications", .arg_count = 0, .executor = &cmd_destroy},
-    {.name = "launch", .description = "Launch an app by Title ID", .arg_count = 1, .executor = &cmd_launch},
-    {.name = "kill", .description = "Kill an app by Title ID", .arg_count = 1, .executor = &cmd_kill},
-    {.name = "nosleep", .description = "Control automatic suspend prevention", .arg_count = 1, .executor = &cmd_nosleep},
-    {.name = "reboot", .description = "Reboot the console", .arg_count = 0, .executor = &cmd_reboot},
-    {.name = "screen", .description = "Turn the screen on or off", .arg_count = 1, .executor = &cmd_screen}
+    {.name = "help", .description = "Display this help screen", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_help},
+    {.name = "destroy", .description = "Kill all running applications", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_destroy},
+    {.name = "launch", .description = "Launch an app by Title ID", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_launch},
+    {.name = "kill", .description = "Kill an app by Title ID", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_kill},
+    {.name = "nosleep", .description = "Control automatic suspend prevention", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_nosleep},
+    {.name = "press", .description = "Press or position a synthetic input", .min_arg_count = 1, .max_arg_count = 4, .validator = &validate_press, .executor = &cmd_press},
+    {.name = "reboot", .description = "Reboot the console", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_reboot},
+    {.name = "release", .description = "Release a synthetic input", .min_arg_count = 1, .max_arg_count = 2, .validator = &validate_release, .executor = &cmd_release},
+    {.name = "screen", .description = "Turn the screen on or off", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_screen},
+    {.name = "version", .description = "Display the Vita Companion version", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_version},
+    {.name = "wait", .description = "Wait for a duration such as 100ms or 3s", .min_arg_count = 1, .max_arg_count = 1, .validator = &validate_wait, .executor = &cmd_wait}
 };
+
+extern volatile int run;
+extern volatile int net_connected;
 
 const cmd_definition *cmd_get_definition(char *cmd_name) {
   for (unsigned int i = 0; i < COUNT_OF(cmd_definitions); i++) {
@@ -115,4 +133,108 @@ void cmd_screen(char **arg_list, size_t arg_count, char *res_msg) {
   } else {
     strcpy(res_msg, "Error: param should be 'on' or 'off'\n");
   }
+}
+
+static bool validate_press(char **arg_list, size_t arg_count,
+    char *res_msg)
+{
+  vitacompanion_input_action action;
+  int result = vitacompanion_parse_press(arg_list, arg_count, &action);
+
+  if (result < 0) {
+    strcpy(res_msg, vitacompanion_input_parse_error(result));
+    return false;
+  }
+  return true;
+}
+
+static bool validate_release(char **arg_list, size_t arg_count,
+    char *res_msg)
+{
+  vitacompanion_input_action action;
+  int result = vitacompanion_parse_release(arg_list, arg_count, &action);
+
+  if (result < 0) {
+    strcpy(res_msg, vitacompanion_input_parse_error(result));
+    return false;
+  }
+  return true;
+}
+
+static bool validate_wait(char **arg_list, size_t arg_count,
+    char *res_msg)
+{
+  uint32_t duration_ms;
+
+  (void)arg_count;
+  if (!parse_wait_duration_ms(arg_list[1], &duration_ms)) {
+    strcpy(res_msg, "Error: Invalid duration.\n");
+    return false;
+  }
+  return true;
+}
+
+void cmd_press(char **arg_list, size_t arg_count, char *res_msg)
+{
+  vitacompanion_input_action action;
+
+  if (!input_is_ready()) {
+    strcpy(res_msg, "Error: Input simulation is unavailable.\n");
+    return;
+  }
+
+  if (vitacompanion_parse_press(arg_list, arg_count, &action) < 0 ||
+      input_apply(&action) < 0) {
+    strcpy(res_msg, "Error: Could not apply synthetic input.\n");
+    return;
+  }
+
+  strcpy(res_msg, "Input pressed.\n");
+}
+
+void cmd_release(char **arg_list, size_t arg_count, char *res_msg)
+{
+  vitacompanion_input_action action;
+
+  if (!input_is_ready()) {
+    strcpy(res_msg, "Error: Input simulation is unavailable.\n");
+    return;
+  }
+
+  if (vitacompanion_parse_release(arg_list, arg_count, &action) < 0 ||
+      input_apply(&action) < 0) {
+    strcpy(res_msg, "Error: Could not release synthetic input.\n");
+    return;
+  }
+
+  strcpy(res_msg, "Input released.\n");
+}
+
+void cmd_wait(char **arg_list, size_t arg_count, char *res_msg)
+{
+  uint32_t duration_ms;
+
+  (void)arg_count;
+  if (!parse_wait_duration_ms(arg_list[1], &duration_ms)) {
+    strcpy(res_msg, "Error: Invalid duration.\n");
+    return;
+  }
+
+  while (duration_ms > 0 && run && net_connected) {
+    uint32_t delay_ms = duration_ms > 50 ? 50 : duration_ms;
+    sceKernelDelayThread(delay_ms * 1000);
+    duration_ms -= delay_ms;
+  }
+
+  if (run && net_connected)
+    strcpy(res_msg, "Waited.\n");
+}
+
+void cmd_version(char **arg_list, size_t arg_count, char *res_msg)
+{
+  (void)arg_list;
+  (void)arg_count;
+
+  if (version_format(res_msg, CMD_RESPONSE_MAX) < 0)
+    strcpy(res_msg, "Error: Could not read module version.\n");
 }
