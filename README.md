@@ -90,11 +90,10 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | Command   | Arguments                       | Explanation                  |
 | --------- | ------------------------------- | ---------------------------- |
 | `help`    | none                            | display the help screen      |
-| `destroy` | none                            | kill all running applications |
 | `launch`  | `<TITLEID>`                     | launch an application by id e.g. `launch VHBB00001` to launch the [Vita Homebrew Browser](https://github.com/devnoname120/vhbb) |
-| `kill`    | `<TITLEID>`                     | kill an application by id    |
 | `nosleep` | `on`, `off` or `status`         | enable or disable automatic suspend prevention. This is enabled by default at boot |
 | `press`   | input target and values         | press a button, position a stick, or start/update a touch |
+| `quit`    | `<TITLEID>` or `all`            | quit an application by id, or all running applications |
 | `reboot`  | none                            | reboot the console           |
 | `release` | input target                    | release one input or all synthetic input |
 | `screen`  | `on` or `off`                   | turn screen on or off        |

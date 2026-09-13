@@ -209,6 +209,13 @@ class CommandFeatureTests(unittest.TestCase):
             r"info\.modver\[1\].*info\.modver\[0\]",
         )
 
+    def test_quit_replaces_kill_and_destroy_commands(self):
+        source = (ROOT / "src" / "cmd_definitions.c").read_text()
+        self.assertIn('{.name = "quit"', source)
+        self.assertIn('strcmp(arg_list[1], "all")', source)
+        self.assertNotIn('{.name = "kill"', source)
+        self.assertNotIn('{.name = "destroy"', source)
+
     def test_kernel_touch_contacts_keep_stable_ids(self):
         source = (ROOT / "kernel" / "main.c").read_text()
         self.assertIn("SYNTHETIC_TOUCH_ID_BASE + slot", source)
