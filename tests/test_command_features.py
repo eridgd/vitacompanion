@@ -172,6 +172,7 @@ class CommandFeatureTests(unittest.TestCase):
 
                 if (vitacompanion_parse_press(touch, 5, &action) < 0 ||
                     action.type != VITACOMPANION_INPUT_TOUCH ||
+                    !action.active ||
                     action.data.touch.slot != 3 ||
                     action.data.touch.x != 1919 ||
                     action.data.touch.y != 1087)
@@ -257,13 +258,12 @@ class CommandFeatureTests(unittest.TestCase):
             }
 
             int vitaCompanionKernelSetTouch(
-                int port, int slot, int x, int y, int active)
+                int port, int slot_and_active, int x, int y)
             {
                 (void)port;
-                (void)slot;
+                (void)slot_and_active;
                 (void)x;
                 (void)y;
-                (void)active;
                 return 0;
             }
 
@@ -298,6 +298,82 @@ class CommandFeatureTests(unittest.TestCase):
             }
             """,
             ("src/input.c",),
+        )
+
+    def test_touch_active_flag_uses_four_argument_kernel_call(self):
+        compile_and_run(
+            r"""
+            #include "input.h"
+            #include <vitacompanion_input.h>
+            #include <vitacompanion_kernel.h>
+
+            static int last_port = -1;
+            static int last_slot_and_active = -1;
+            static int last_x = -1;
+            static int last_y = -1;
+
+            int vitaCompanionKernelGetApiVersion(void)
+            {
+                return VITACOMPANION_KERNEL_ABI_VERSION;
+            }
+
+            int vitaCompanionKernelSetButtons(uint32_t buttons, int pressed)
+            {
+                (void)buttons;
+                (void)pressed;
+                return 0;
+            }
+
+            int vitaCompanionKernelSetAnalog(
+                int stick, int x, int y, int active)
+            {
+                (void)stick;
+                (void)x;
+                (void)y;
+                (void)active;
+                return 0;
+            }
+
+            int vitaCompanionKernelSetTouch(
+                int port, int slot_and_active, int x, int y)
+            {
+                last_port = port;
+                last_slot_and_active = slot_and_active;
+                last_x = x;
+                last_y = y;
+                return 0;
+            }
+
+            int vitaCompanionKernelReset(void)
+            {
+                return 0;
+            }
+
+            int main(void)
+            {
+                vitacompanion_input_action action;
+                char *press[] = {"press", "front-touch", "2", "960", "544"};
+                char *release[] = {"release", "front-touch", "2"};
+
+                if (input_start() < 0 ||
+                    vitacompanion_parse_press(press, 5, &action) < 0 ||
+                    input_apply(&action) < 0 ||
+                    last_port != VITACOMPANION_TOUCH_FRONT ||
+                    last_slot_and_active !=
+                        (VITACOMPANION_TOUCH_ACTIVE_FLAG | 2) ||
+                    last_x != 960 || last_y != 544)
+                    return 1;
+
+                if (vitacompanion_parse_release(release, 3, &action) < 0 ||
+                    input_apply(&action) < 0 ||
+                    last_slot_and_active != 2)
+                    return 2;
+
+                input_end();
+                return 0;
+            }
+            """,
+            ("src/input.c", "src/input_parse.c"),
         )
 
     def test_kernel_module_is_a_required_taihen_dependency(self):

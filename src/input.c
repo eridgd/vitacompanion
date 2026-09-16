@@ -47,10 +47,10 @@ int input_apply(const vitacompanion_input_action *action)
     case VITACOMPANION_INPUT_TOUCH:
         return vitaCompanionKernelSetTouch(
             action->data.touch.port,
-            action->data.touch.slot,
+            action->data.touch.slot |
+                (action->active ? VITACOMPANION_TOUCH_ACTIVE_FLAG : 0),
             action->data.touch.x,
-            action->data.touch.y,
-            action->active);
+            action->data.touch.y);
     case VITACOMPANION_INPUT_RESET:
         return vitaCompanionKernelReset();
     default:

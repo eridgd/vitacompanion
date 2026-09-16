@@ -342,12 +342,16 @@ int vitaCompanionKernelSetAnalog(int stick, int x, int y, int active)
     return 0;
 }
 
-int vitaCompanionKernelSetTouch(int port, int slot, int x, int y,
-    int active)
+int vitaCompanionKernelSetTouch(int port, int slot_and_active, int x, int y)
 {
+    int slot = slot_and_active & 0xff;
+    int active = (slot_and_active & VITACOMPANION_TOUCH_ACTIVE_FLAG) != 0;
+
     if (port < VITACOMPANION_TOUCH_FRONT ||
         port > VITACOMPANION_TOUCH_REAR ||
-        slot < 0 || slot >= VITACOMPANION_TOUCH_SLOTS ||
+        (slot_and_active & ~0x103) != 0 ||
+        slot < 0 ||
+        slot >= VITACOMPANION_TOUCH_SLOTS ||
         x < 0 || x > VITACOMPANION_TOUCH_MAX_X ||
         y < 0 || y > VITACOMPANION_TOUCH_MAX_Y)
         return -1;
