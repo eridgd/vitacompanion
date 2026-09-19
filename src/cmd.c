@@ -5,6 +5,7 @@
 
 #include <psp2/kernel/modulemgr.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <vitasdk.h>
 
 #ifndef CMD_PORT
@@ -16,21 +17,37 @@
 #endif
 #define ARG_MAX (20)
 #define CMD_MAX (32)
-#define CMD_REQUEST_MAX (2048)
-#define CMD_RES_MAX (8192)
 #define CMD_IO_TIMEOUT_US (15 * 1000 * 1000)
+#define CMD_BUSY_RECV_TIMEOUT_US (2 * 1000 * 1000)
 #define CMD_START_TIMEOUT_MS 5000
+#define CMD_WORKER_STOP_TIMEOUT_US (2 * 1000 * 1000)
+
+/* Every accepted connection is served by its own worker thread so that an
+ * executor which never returns (a launch that hangs the target application,
+ * for instance) cannot stall the accept loop and take the whole command
+ * channel down with it. CMD_WORKER_MAX bounds how many requests may be in
+ * flight; when the pool is exhausted the accept thread still serves a bare
+ * `reboot` inline so remote recovery is always possible. */
+#define CMD_WORKER_MAX (4)
 
 extern volatile int run;
 extern volatile int all_is_up;
 extern volatile int net_connected;
 
+typedef struct {
+    int busy;
+    SceUID thid;
+    int sockfd;
+    char request[CMD_REQUEST_MAX + 1];
+    char response[CMD_RES_MAX];
+} cmd_worker;
+
 static SceUID loader_thid = -1;
-static SceUID loader_client_mtx = -1;
+static SceUID loader_worker_mtx = -1;
 static int loader_sockfd = -1;
-static int loader_client_sockfd = -1;
 static volatile int loader_stopping;
 static volatile int loader_start_state;
+static cmd_worker loader_workers[CMD_WORKER_MAX];
 
 typedef struct {
     const cmd_definition* definition;
@@ -159,6 +176,140 @@ void cmd_handle(char* cmd, unsigned int cmd_size, char* res_msg)
     }
 }
 
+/* Reads one request from `sockfd`, runs it and writes the reply. */
+static void cmd_serve_request(int sockfd, char* request, char* response)
+{
+    int size = cmd_receive_request(sockfd, request, CMD_REQUEST_MAX);
+
+    response[0] = '\0';
+    if (size > 0)
+    {
+        request[size] = '\0';
+        if (size == CMD_REQUEST_MAX &&
+            request[size - 1] != '\n' &&
+            request[size - 1] != '\r')
+            strcpy(response, "Error: Command request is too long.\n");
+        else
+            cmd_handle(request, (unsigned int)size, response);
+    }
+
+    if (response[0] != '\0')
+        cmd_send_all(sockfd, response);
+}
+
+static int cmd_worker_thread(unsigned int args, void* argp)
+{
+    cmd_worker* worker = *(cmd_worker**)argp;
+
+    (void)args;
+
+    cmd_serve_request(worker->sockfd, worker->request, worker->response);
+
+    sceKernelLockMutex(loader_worker_mtx, 1, NULL);
+    sceNetSocketClose(worker->sockfd);
+    worker->sockfd = -1;
+    worker->thid = -1;
+    worker->busy = 0;
+    sceKernelUnlockMutex(loader_worker_mtx, 1);
+
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
+/* Returns true when the request is exactly one `reboot` command. */
+static bool cmd_request_is_bare_reboot(char* request, unsigned int size)
+{
+    char* command_strings[2] = {0};
+    char* args[2] = {0};
+    size_t command_count = 0;
+
+    if (!parse_cmd_chain(request, size, command_strings, 2, &command_count) ||
+        command_count != 1)
+        return false;
+
+    return parse_cmd(command_strings[0], strlen(command_strings[0]), args, 2) == 1 &&
+        strcmp(args[0], "reboot") == 0;
+}
+
+/* Called on the accept thread when every worker slot is taken. Only a bare
+ * `reboot` is honoured here: it never blocks, and it is the one command a
+ * wedged console must still accept. Everything else is refused quickly so
+ * the accept loop stays responsive. */
+static void cmd_serve_busy(int sockfd)
+{
+    static char request[CMD_REQUEST_MAX + 1];
+    static char response[CMD_RES_MAX];
+    int timeout_us = CMD_BUSY_RECV_TIMEOUT_US;
+    int size;
+
+    sceNetSetsockopt(sockfd, SCE_NET_SOL_SOCKET,
+        SCE_NET_SO_RCVTIMEO, &timeout_us, sizeof(timeout_us));
+
+    size = cmd_receive_request(sockfd, request, CMD_REQUEST_MAX);
+    if (size <= 0)
+        return;
+    request[size] = '\0';
+
+    if (cmd_request_is_bare_reboot(request, (unsigned int)size))
+    {
+        char* args[1] = { "reboot" };
+        cmd_reboot(args, 1, response);
+    }
+    else
+    {
+        strcpy(response,
+            "Error: Too many commands in progress; only 'reboot' is accepted "
+            "until one finishes.\n");
+    }
+
+    cmd_send_all(sockfd, response);
+}
+
+static cmd_worker* cmd_worker_take(void)
+{
+    int i;
+
+    for (i = 0; i < CMD_WORKER_MAX; ++i)
+    {
+        if (!loader_workers[i].busy)
+        {
+            loader_workers[i].busy = 1;
+            loader_workers[i].thid = -1;
+            loader_workers[i].sockfd = -1;
+            return &loader_workers[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int cmd_worker_start(cmd_worker* worker, int sockfd)
+{
+    char name[48];
+    SceUID thid;
+    int result;
+
+    snprintf(name, sizeof(name), "vitacompanion_cmd_worker_%d",
+        (int)(worker - loader_workers));
+    thid = sceKernelCreateThread(name, cmd_worker_thread, 0x40, 0x10000,
+        0, 0, NULL);
+    if (thid < 0)
+        return thid;
+
+    worker->sockfd = sockfd;
+    worker->thid = thid;
+    result = sceKernelStartThread(thid, sizeof(worker), &worker);
+    if (result < 0)
+    {
+        sceKernelDeleteThread(thid);
+        worker->sockfd = -1;
+        worker->thid = -1;
+        return result;
+    }
+
+    return 0;
+}
+
 int cmd_thread(unsigned int args, void* argp)
 {
     struct SceNetSockaddrIn loaderaddr = {0};
@@ -194,45 +345,38 @@ int cmd_thread(unsigned int args, void* argp)
         if (client_sockfd >= 0)
         {
             int timeout_us = CMD_IO_TIMEOUT_US;
-            char cmd[CMD_REQUEST_MAX + 1] = { 0 };
-            char res_msg[CMD_RES_MAX] = { 0 };
-            int size;
+            cmd_worker* worker;
+            int started = -1;
 
             sceNetSetsockopt(client_sockfd, SCE_NET_SOL_SOCKET,
                 SCE_NET_SO_SNDTIMEO, &timeout_us, sizeof(timeout_us));
             sceNetSetsockopt(client_sockfd, SCE_NET_SOL_SOCKET,
                 SCE_NET_SO_RCVTIMEO, &timeout_us, sizeof(timeout_us));
 
-            sceKernelLockMutex(loader_client_mtx, 1, NULL);
+            sceKernelLockMutex(loader_worker_mtx, 1, NULL);
             if (loader_stopping)
             {
-                sceKernelUnlockMutex(loader_client_mtx, 1);
+                sceKernelUnlockMutex(loader_worker_mtx, 1);
                 sceNetSocketClose(client_sockfd);
                 break;
             }
-            loader_client_sockfd = client_sockfd;
-            sceKernelUnlockMutex(loader_client_mtx, 1);
-
-            size = cmd_receive_request(
-                client_sockfd, cmd, CMD_REQUEST_MAX);
-
-            if (size > 0)
+            worker = cmd_worker_take();
+            if (worker)
             {
-                cmd[size] = '\0';
-                if (size == CMD_REQUEST_MAX &&
-                    cmd[size - 1] != '\n' &&
-                    cmd[size - 1] != '\r')
-                    strcpy(res_msg, "Error: Command request is too long.\n");
-                else
-                    cmd_handle(cmd, (unsigned int)size, res_msg);
+                started = cmd_worker_start(worker, client_sockfd);
+                if (started < 0)
+                    worker->busy = 0;
             }
+            sceKernelUnlockMutex(loader_worker_mtx, 1);
 
-            if (res_msg[0] != '\0')
-                cmd_send_all(client_sockfd, res_msg);
+            if (started >= 0)
+                continue;
 
-            sceKernelLockMutex(loader_client_mtx, 1, NULL);
-            loader_client_sockfd = -1;
-            sceKernelUnlockMutex(loader_client_mtx, 1);
+            if (worker == NULL)
+                cmd_serve_busy(client_sockfd);
+            else
+                cmd_send_all(client_sockfd,
+                    "Error: Could not start a command worker.\n");
             sceNetSocketClose(client_sockfd);
         }
         else if (loader_stopping)
@@ -258,6 +402,16 @@ exit:
     return 0;
 }
 
+static int cmd_workers_idle(void)
+{
+    int i;
+
+    for (i = 0; i < CMD_WORKER_MAX; ++i)
+        if (loader_workers[i].busy)
+            return 0;
+    return 1;
+}
+
 int cmd_start()
 {
     int result;
@@ -266,31 +420,41 @@ int cmd_start()
     if (loader_thid >= 0)
         return -1;
 
-    loader_client_mtx = sceKernelCreateMutex(
-        "vitacompanion_cmd_client_mutex", 0, 0, NULL);
-    if (loader_client_mtx < 0)
-        return loader_client_mtx;
+    /* The worker mutex outlives cmd_end() while a worker is still stuck in
+     * an executor, so only create it when no previous instance survives. */
+    if (loader_worker_mtx < 0)
+    {
+        loader_worker_mtx = sceKernelCreateMutex(
+            "vitacompanion_cmd_worker_mutex", 0, 0, NULL);
+        if (loader_worker_mtx < 0)
+            return loader_worker_mtx;
+    }
 
     loader_thid = sceKernelCreateThread("vitacompanion_cmd_thread", cmd_thread, 0x40, 0x10000, 0, 0, NULL);
     if (loader_thid < 0)
     {
         result = loader_thid;
-        sceKernelDeleteMutex(loader_client_mtx);
-        loader_client_mtx = -1;
+        if (cmd_workers_idle())
+        {
+            sceKernelDeleteMutex(loader_worker_mtx);
+            loader_worker_mtx = -1;
+        }
         return result;
     }
 
     loader_sockfd = -1;
-    loader_client_sockfd = -1;
     loader_stopping = 0;
     loader_start_state = 0;
     result = sceKernelStartThread(loader_thid, 0, NULL);
     if (result < 0)
     {
         sceKernelDeleteThread(loader_thid);
-        sceKernelDeleteMutex(loader_client_mtx);
         loader_thid = -1;
-        loader_client_mtx = -1;
+        if (cmd_workers_idle())
+        {
+            sceKernelDeleteMutex(loader_worker_mtx);
+            loader_worker_mtx = -1;
+        }
         return result;
     }
 
@@ -305,10 +469,13 @@ int cmd_start()
         if (loader_sockfd >= 0)
             sceNetSocketClose(loader_sockfd);
         sceKernelWaitThreadEnd(loader_thid, NULL, NULL);
-        sceKernelDeleteMutex(loader_client_mtx);
         loader_thid = -1;
         loader_sockfd = -1;
-        loader_client_mtx = -1;
+        if (cmd_workers_idle())
+        {
+            sceKernelDeleteMutex(loader_worker_mtx);
+            loader_worker_mtx = -1;
+        }
         return -1;
     }
 
@@ -319,6 +486,8 @@ void cmd_end()
 {
     const int abort_flags = SCE_NET_SOCKET_ABORT_FLAG_RCV_PRESERVATION |
         SCE_NET_SOCKET_ABORT_FLAG_SND_PRESERVATION;
+    SceUID worker_thids[CMD_WORKER_MAX];
+    int i;
 
     if (loader_thid < 0)
         return;
@@ -327,21 +496,37 @@ void cmd_end()
     if (loader_sockfd >= 0)
         sceNetSocketClose(loader_sockfd);
 
-    if (loader_client_mtx >= 0)
+    /* Abort every in-flight client socket so workers blocked on network I/O
+     * return, then let the accept loop drain. */
+    sceKernelLockMutex(loader_worker_mtx, 1, NULL);
+    for (i = 0; i < CMD_WORKER_MAX; ++i)
     {
-        sceKernelLockMutex(loader_client_mtx, 1, NULL);
-        if (loader_client_sockfd >= 0)
-            sceNetSocketAbort(loader_client_sockfd, abort_flags);
-        sceKernelUnlockMutex(loader_client_mtx, 1);
+        worker_thids[i] = loader_workers[i].busy ? loader_workers[i].thid : -1;
+        if (loader_workers[i].busy && loader_workers[i].sockfd >= 0)
+            sceNetSocketAbort(loader_workers[i].sockfd, abort_flags);
     }
+    sceKernelUnlockMutex(loader_worker_mtx, 1);
 
     sceKernelWaitThreadEnd(loader_thid, NULL, NULL);
-    if (loader_client_mtx >= 0)
-        sceKernelDeleteMutex(loader_client_mtx);
+
+    /* A worker stuck inside an executor cannot be interrupted; give each one
+     * a bounded grace period and otherwise leave it to finish on its own.
+     * Its slot stays marked busy until it does. */
+    for (i = 0; i < CMD_WORKER_MAX; ++i)
+    {
+        SceUInt timeout_us = CMD_WORKER_STOP_TIMEOUT_US;
+
+        if (worker_thids[i] >= 0)
+            sceKernelWaitThreadEnd(worker_thids[i], NULL, &timeout_us);
+    }
 
     loader_thid = -1;
     loader_sockfd = -1;
-    loader_client_sockfd = -1;
-    loader_client_mtx = -1;
     loader_start_state = 0;
+
+    if (cmd_workers_idle())
+    {
+        sceKernelDeleteMutex(loader_worker_mtx);
+        loader_worker_mtx = -1;
+    }
 }

@@ -45,6 +45,8 @@ add_library(ftpvita STATIC
         vendor/libftpvita/ftpvita.h
         vendor/libftpvita/ftpvita_io.c
         vendor/libftpvita/ftpvita_io.h
+        vendor/libftpvita/ftpvita_mem.c
+        vendor/libftpvita/ftpvita_mem.h
         vendor/libftpvita/ftpvita_path.c
         vendor/libftpvita/ftpvita_path.h
         vendor/libftpvita/ftpvita_protocol.c
@@ -106,7 +108,6 @@ target_compile_definitions(vitacompanion PRIVATE
 add_dependencies(vitacompanion vitacompanion_kernel_stubs)
 
 target_link_libraries(vitacompanion
-  taipool
   ftpvita
   k
   gcc
@@ -114,6 +115,7 @@ target_link_libraries(vitacompanion
   SceNet_stub_weak
   SceNetCtl_stub_weak
   SceSysmodule_stub_weak
+  SceSysmem_stub_weak
   SceKernelThreadMgr_stub_weak
   SceIofilemgr_stub_weak
   SceRtc_stub_weak
@@ -128,6 +130,10 @@ set_target_properties(vitacompanion
   PROPERTIES LINK_FLAGS "-nostdlib"
 )
 
+# Re-run configure when the module metadata changes so a version bump is
+# picked up without a fresh build directory.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_SOURCE_DIR}/vitacompanion.yml")
 file(READ "${CMAKE_SOURCE_DIR}/vitacompanion.yml" VITACOMPANION_EXPORTS)
 string(REGEX REPLACE "^vitacompanion:"
   "${VITACOMPANION_MODULE_NAME}:"

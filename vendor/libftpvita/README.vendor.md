@@ -37,3 +37,11 @@ Local changes:
   caller instead of advertising an unavailable service.
 - Detach clients before waiting for their threads during shutdown so network
   state changes cannot deadlock the client-list mutex.
+- Allocate transfer buffers, client state, and the net init pool as SceSysmem
+  memory blocks (`ftpvita_mem.c`) instead of through a user-space heap, so
+  the server no longer depends on taipool. taipool's first-fit pool splits an
+  exact-fit block into a header with an underflowed size, which corrupts the
+  next block and leaves every later alloc/free spinning under its semaphore;
+  it also cannot place a second 512 KiB buffer once any other allocation
+  lands mid-pool. Both showed up as RETR/STOR failing while LIST kept working.
+- Report allocation failures as transient `451` replies rather than `550`.

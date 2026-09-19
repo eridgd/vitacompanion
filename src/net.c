@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <ftpvita.h>
+#include <stdio.h>
+#include <string.h>
 #include <vitasdk.h>
 
 #define NET_CTL_ERROR_NOT_TERMINATED ((int)0x80412102)
@@ -58,6 +60,66 @@ void net_end()
     }
 }
 
+/* FTP `SITE <command chain>`: runs a command-port request over the FTP
+ * control connection. FTP serves every client on its own thread, so this
+ * remains usable (for `SITE reboot` in particular) even if the command port
+ * is wedged by an executor that never returns. */
+static void ftp_site_command(ftpvita_client_info_t* client)
+{
+    static const char* const reply_ok = "200";
+    static const char* const reply_failed = "500";
+    char request[CMD_REQUEST_MAX + 2];
+    char response[CMD_RES_MAX];
+    char line[256];
+    char text[256 - 8];
+    const char* code;
+    const char* cursor;
+    size_t length;
+
+    cursor = client->recv_cmd_args;
+    while (*cursor == ' ' || *cursor == '\t')
+        cursor++;
+    length = strlen(cursor);
+    if (length == 0)
+    {
+        ftpvita_ext_client_send_ctrl_msg(client,
+            "501 SITE requires a vitacompanion command." FTPVITA_EOL);
+        return;
+    }
+    if (length > CMD_REQUEST_MAX)
+    {
+        ftpvita_ext_client_send_ctrl_msg(client,
+            "501 SITE command is too long." FTPVITA_EOL);
+        return;
+    }
+
+    memcpy(request, cursor, length);
+    request[length] = '\n';
+    request[length + 1] = '\0';
+    cmd_handle(request, (unsigned int)(length + 1), response);
+
+    code = strncmp(response, "Error:", 6) == 0 ? reply_failed : reply_ok;
+    cursor = response;
+    while (*cursor)
+    {
+        const char* end = strchr(cursor, '\n');
+        size_t line_length = end ? (size_t)(end - cursor) : strlen(cursor);
+
+        /* libk's snprintf does not implement "%.*s", so copy the line
+         * out and print it with a plain "%s". */
+        if (line_length > sizeof(text) - 1)
+            line_length = sizeof(text) - 1;
+        memcpy(text, cursor, line_length);
+        text[line_length] = '\0';
+        snprintf(line, sizeof(line), "%s-%s" FTPVITA_EOL, code, text);
+        ftpvita_ext_client_send_ctrl_msg(client, line);
+        cursor = end ? end + 1 : cursor + line_length;
+    }
+    snprintf(line, sizeof(line), "%s SITE command %s." FTPVITA_EOL, code,
+        code == reply_ok ? "completed" : "failed");
+    ftpvita_ext_client_send_ctrl_msg(client, line);
+}
+
 static void do_net_connected()
 {
     char vita_ip[16];
@@ -80,6 +142,7 @@ static void do_net_connected()
         ftpvita_add_device("imc0:");
         ftpvita_add_device("xmc0:");
         ftpvita_add_device("grw0:");
+        ftpvita_ext_add_custom_command("SITE", ftp_site_command);
 
         if (cmd_start() >= 0)
         {

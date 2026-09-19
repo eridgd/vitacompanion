@@ -2,3 +2,6 @@ build/
 cmake-*/
 .idea/
 .vscode/
+build-*/
+.DS_Store
+__pycache__/

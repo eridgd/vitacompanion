@@ -4,11 +4,11 @@
 
 #include "ftpvita.h"
 #include "ftpvita_io.h"
+#include "ftpvita_mem.h"
 #include "ftpvita_path.h"
 #include "ftpvita_protocol.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <sys/syslimits.h>
@@ -90,13 +90,6 @@ static int net_init = -1;
 
 static void (*info_log_cb)(const char *) = NULL;
 static void (*debug_log_cb)(const char *) = NULL;
-
-/* taipool's stdlib-compatible free() does not accept NULL. */
-static void free_allocated(void *ptr)
-{
-	if (ptr)
-		free(ptr);
-}
 
 static void log_func(ftpvita_log_cb_t log_cb, const char *s, ...)
 {
@@ -951,19 +944,19 @@ static void send_file(ftpvita_client_info_t *client, const char *path)
 			return;
 		}
 
-		buffer = malloc(client->transfer_type == FTP_TRANSFER_TYPE_ASCII ?
+		buffer = ftpvita_mem_alloc(client->transfer_type == FTP_TRANSFER_TYPE_ASCII ?
 			ASCII_INPUT_SIZE : file_buf_size);
 		if (buffer == NULL) {
 			sceIoClose(fd);
-			client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
+			client_send_ctrl_msg(client, "451 Could not allocate a transfer buffer." FTPVITA_EOL);
 			return;
 		}
 		if (client->transfer_type == FTP_TRANSFER_TYPE_ASCII) {
-			ascii_buffer = malloc(ASCII_OUTPUT_SIZE);
+			ascii_buffer = ftpvita_mem_alloc(ASCII_OUTPUT_SIZE);
 			if (ascii_buffer == NULL) {
 				sceIoClose(fd);
-				free_allocated(buffer);
-				client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
+				ftpvita_mem_free(buffer);
+				client_send_ctrl_msg(client, "451 Could not allocate a transfer buffer." FTPVITA_EOL);
 				return;
 			}
 			ftpvita_ascii_state_init(&ascii_state);
@@ -971,8 +964,8 @@ static void send_file(ftpvita_client_info_t *client, const char *path)
 
 		if (client_open_data_connection(client) < 0) {
 			sceIoClose(fd);
-			free_allocated(buffer);
-			free_allocated(ascii_buffer);
+			ftpvita_mem_free(buffer);
+			ftpvita_mem_free(ascii_buffer);
 			if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
 				client_close_data_connection(client);
 			client_send_ctrl_msg(client, "425 Cannot open data connection." FTPVITA_EOL);
@@ -1017,8 +1010,8 @@ static void send_file(ftpvita_client_info_t *client, const char *path)
 		}
 
 		sceIoClose(fd);
-		free_allocated(buffer);
-		free_allocated(ascii_buffer);
+		ftpvita_mem_free(buffer);
+		ftpvita_mem_free(ascii_buffer);
 		client_close_data_connection(client);
 		if (transfer_ok)
 			client_send_ctrl_msg(client, "226 Transfer completed." FTPVITA_EOL);
@@ -1085,19 +1078,19 @@ static void receive_file(ftpvita_client_info_t *client, const char *path,
 			return;
 		}
 
-		buffer = malloc(client->transfer_type == FTP_TRANSFER_TYPE_ASCII ?
+		buffer = ftpvita_mem_alloc(client->transfer_type == FTP_TRANSFER_TYPE_ASCII ?
 			ASCII_INPUT_SIZE : file_buf_size);
 		if (buffer == NULL) {
 			sceIoClose(fd);
-			client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
+			client_send_ctrl_msg(client, "451 Could not allocate a transfer buffer." FTPVITA_EOL);
 			return;
 		}
 		if (client->transfer_type == FTP_TRANSFER_TYPE_ASCII) {
-			ascii_buffer = malloc(ASCII_OUTPUT_SIZE);
+			ascii_buffer = ftpvita_mem_alloc(ASCII_OUTPUT_SIZE);
 			if (ascii_buffer == NULL) {
 				sceIoClose(fd);
-				free_allocated(buffer);
-				client_send_ctrl_msg(client, "550 Could not allocate memory." FTPVITA_EOL);
+				ftpvita_mem_free(buffer);
+				client_send_ctrl_msg(client, "451 Could not allocate a transfer buffer." FTPVITA_EOL);
 				return;
 			}
 			ftpvita_ascii_state_init(&ascii_state);
@@ -1105,8 +1098,8 @@ static void receive_file(ftpvita_client_info_t *client, const char *path,
 
 		if (client_open_data_connection(client) < 0) {
 			sceIoClose(fd);
-			free_allocated(buffer);
-			free_allocated(ascii_buffer);
+			ftpvita_mem_free(buffer);
+			ftpvita_mem_free(ascii_buffer);
 			if (client->data_con_type != FTP_DATA_CONNECTION_NONE)
 				client_close_data_connection(client);
 			sceIoRemove(path);
@@ -1151,8 +1144,8 @@ static void receive_file(ftpvita_client_info_t *client, const char *path,
 		}
 
 		sceIoClose(fd);
-		free_allocated(buffer);
-		free_allocated(ascii_buffer);
+		ftpvita_mem_free(buffer);
+		ftpvita_mem_free(ascii_buffer);
 		if (bytes_recv == 0) {
 			client_send_ctrl_msg(client, "226 Transfer completed." FTPVITA_EOL);
 		} else {
@@ -1329,11 +1322,11 @@ static void cmd_SIZE_func(ftpvita_client_info_t *client)
 		int pending_cr = 0;
 
 		fd = sceIoOpen(get_vita_path(path), SCE_O_RDONLY, 0777);
-		buffer = malloc(ASCII_INPUT_SIZE);
+		buffer = ftpvita_mem_alloc(ASCII_INPUT_SIZE);
 		if (fd < 0 || !buffer) {
 			if (fd >= 0)
 				sceIoClose(fd);
-			free_allocated(buffer);
+			ftpvita_mem_free(buffer);
 			client_send_ctrl_msg(client,
 				"451 Could not calculate ASCII transfer size." FTPVITA_EOL);
 			return;
@@ -1359,7 +1352,7 @@ static void cmd_SIZE_func(ftpvita_client_info_t *client)
 		if (pending_cr)
 			transfer_size += 2;
 		sceIoClose(fd);
-		free_allocated(buffer);
+		ftpvita_mem_free(buffer);
 		if (bytes_read < 0) {
 			client_send_ctrl_msg(client,
 				"451 Could not calculate ASCII transfer size." FTPVITA_EOL);
@@ -1688,7 +1681,7 @@ static void client_list_thread_end()
 		next = it->next;
 		/* Wait until the client threads ends */
 		sceKernelWaitThreadEnd(it->thid, NULL, NULL);
-		free_allocated(it);
+		ftpvita_mem_free(it);
 	}
 }
 
@@ -1844,7 +1837,7 @@ cleanup:
 	DEBUG("Client thread %i exiting!\n", client->num);
 
 	if (client_owns_cleanup)
-		free_allocated(client);
+		ftpvita_mem_free(client);
 
 	sceKernelExitDeleteThread(0);
 	return 0;
@@ -1932,7 +1925,7 @@ static int server_thread(SceSize args, void *argp)
 			}
 
 			/* Allocate the ftpvita_client_info_t struct for the new client */
-			ftpvita_client_info_t *client = malloc(sizeof(*client));
+			ftpvita_client_info_t *client = ftpvita_mem_alloc(sizeof(*client));
 			if (client == NULL) {
 				sceKernelDeleteThread(client_thid);
 				sceNetSocketClose(client_sockfd);
@@ -1971,7 +1964,7 @@ static int server_thread(SceSize args, void *argp)
 					"421 Too many FTP clients." FTPVITA_EOL), 0);
 				sceKernelDeleteThread(client_thid);
 				sceNetSocketClose(client_sockfd);
-				free_allocated(client);
+				ftpvita_mem_free(client);
 				continue;
 			}
 
@@ -1981,7 +1974,7 @@ static int server_thread(SceSize args, void *argp)
 				client_list_delete(client);
 				sceKernelDeleteThread(client_thid);
 				sceNetSocketClose(client_sockfd);
-				free_allocated(client);
+				ftpvita_mem_free(client);
 			}
 		} else {
 			if (server_stopping) {
@@ -2029,7 +2022,7 @@ int ftpvita_init(char *vita_ip, unsigned short int *vita_port)
 		DEBUG("Net is already initialized.\n");
 		net_init = -1;
 	} else if (ret == (int)SCE_NET_ERROR_ENOTINIT) {
-		net_memory = malloc(NET_INIT_SIZE);
+		net_memory = ftpvita_mem_alloc(NET_INIT_SIZE);
 		if (!net_memory) {
 			ret = -1;
 			goto error_netinit;
@@ -2145,7 +2138,7 @@ error_netctlinit:
 	}
 error_netinit:
 	if (net_memory) {
-		free_allocated(net_memory);
+		ftpvita_mem_free(net_memory);
 		net_memory = NULL;
 	}
 error_netstat:
@@ -2188,7 +2181,7 @@ void ftpvita_fini()
 		if (net_init == 0)
 			sceNetTerm();
 		if (net_memory)
-			free_allocated(net_memory);
+			ftpvita_mem_free(net_memory);
 
 		netctl_init = -1;
 		net_init = -1;

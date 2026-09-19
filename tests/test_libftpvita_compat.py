@@ -565,17 +565,59 @@ class LibftpvitaCompatTests(unittest.TestCase):
         self.assertIn("cursor[cmd_length] - ('a' - 'A')", line_handler)
         self.assertIn("args_length >= 4", source)
 
-    def test_command_service_tracks_and_aborts_the_accepted_socket(self):
+    def test_command_service_runs_requests_on_bounded_workers(self):
         source = (ROOT / "src" / "cmd.c").read_text()
-        self.assertIn("loader_client_sockfd", source)
         self.assertIn("loader_start_state", source)
         self.assertIn("SCE_NET_SO_RCVTIMEO", source)
+        self.assertIn("#define CMD_WORKER_MAX", source)
+        self.assertIn("static int cmd_worker_thread", source)
+
+        accept_start = source.index("int cmd_thread(")
+        accept_end = source.index("static int cmd_workers_idle", accept_start)
+        accept_loop = source[accept_start:accept_end]
+        # The accept thread hands the socket to a worker and never runs an
+        # executor itself, so a blocking command cannot wedge the port.
+        self.assertIn("cmd_worker_start(worker, client_sockfd)", accept_loop)
+        self.assertNotIn("cmd_handle(", accept_loop)
+        self.assertNotIn("cmd_receive_request(client_sockfd", accept_loop)
+        self.assertIn("cmd_serve_busy(client_sockfd)", accept_loop)
+
+    def test_command_service_always_accepts_reboot_when_workers_are_busy(self):
+        source = (ROOT / "src" / "cmd.c").read_text()
+        busy_start = source.index("static void cmd_serve_busy")
+        busy_end = source.index("static cmd_worker* cmd_worker_take", busy_start)
+        busy = source[busy_start:busy_end]
+        self.assertIn("cmd_request_is_bare_reboot(request", busy)
+        self.assertIn("cmd_reboot(args, 1, response)", busy)
+        self.assertIn("only 'reboot' is accepted", busy)
+        self.assertIn("CMD_BUSY_RECV_TIMEOUT_US", busy)
+
+    def test_command_service_shutdown_aborts_workers_and_does_not_wait_forever(self):
+        source = (ROOT / "src" / "cmd.c").read_text()
         shutdown_start = source.index("void cmd_end()")
         shutdown = source[shutdown_start:]
         self.assertLess(
-            shutdown.index("sceNetSocketAbort(loader_client_sockfd"),
+            shutdown.index("sceNetSocketAbort(loader_workers[i].sockfd"),
             shutdown.index("sceKernelWaitThreadEnd(loader_thid"),
         )
+        self.assertIn("sceKernelWaitThreadEnd(worker_thids[i], NULL, &timeout_us)", shutdown)
+        self.assertIn("CMD_WORKER_STOP_TIMEOUT_US", shutdown)
+
+    def test_ftp_site_command_bridges_to_the_command_handler(self):
+        net_source = (ROOT / "src" / "net.c").read_text()
+        self.assertIn('ftpvita_ext_add_custom_command("SITE", ftp_site_command);', net_source)
+        site_start = net_source.index("static void ftp_site_command")
+        site_end = net_source.index("static void do_net_connected", site_start)
+        site = net_source[site_start:site_end]
+        self.assertIn("cmd_handle(request", site)
+        self.assertIn('"501 SITE requires a vitacompanion command."', site)
+        self.assertIn('"%s SITE command %s." FTPVITA_EOL', site)
+        # libk's snprintf prints "%.*s" literally on the console.
+        self.assertNotIn('"%s-%.*s"', site)
+        self.assertIn('"%s-%s" FTPVITA_EOL', site)
+        self.assertIn('code == reply_ok ? "completed" : "failed"', site)
+        cmd_header = (ROOT / "src" / "cmd.h").read_text()
+        self.assertIn("void cmd_handle(char* cmd, unsigned int cmd_size, char* res_msg);", cmd_header)
 
     def test_network_teardown_stops_command_service_before_ftp_network_term(self):
         source = (ROOT / "src" / "net.c").read_text()
@@ -592,14 +634,14 @@ class LibftpvitaCompatTests(unittest.TestCase):
         self.assertIn("mode |= SCE_O_TRUNC;", receive)
         self.assertIn("sceIoRemove(path);", receive)
 
-    def test_client_allocation_is_not_folded_into_taipool_calloc(self):
+    def test_client_allocation_initializes_every_field_explicitly(self):
         source = (VENDOR / "ftpvita.c").read_text()
         server_start = source.index("static int server_thread")
         server_end = source.index("int ftpvita_init", server_start)
         server = source[server_start:server_end]
 
         allocation_start = server.index(
-            "ftpvita_client_info_t *client = malloc(sizeof(*client));"
+            "ftpvita_client_info_t *client = ftpvita_mem_alloc(sizeof(*client));"
         )
         initialization_start = server.index("client->num =", allocation_start)
         allocation = server[allocation_start:initialization_start]
@@ -621,19 +663,41 @@ class LibftpvitaCompatTests(unittest.TestCase):
         self.assertIn("ftpvita_parse_restart_offset", rest_handler)
         self.assertNotIn("sscanf", rest_handler)
 
-    def test_taipool_cleanup_never_frees_a_null_pointer(self):
+    def test_ftp_server_allocates_from_kernel_memblocks_not_a_user_heap(self):
         ftp_source = (VENDOR / "ftpvita.c").read_text()
+        mem_source = (VENDOR / "ftpvita_mem.c").read_text()
         main_source = (ROOT / "src" / "main.c").read_text()
+        cmake = (ROOT / "CMakeLists.txt").read_text()
 
-        safe_free_start = ftp_source.index("static void free_allocated")
-        safe_free_end = ftp_source.index("static void log_func", safe_free_start)
-        safe_free = ftp_source[safe_free_start:safe_free_end]
-        self.assertIn("if (ptr)", safe_free)
+        # taipool's first-fit pool corrupts itself on exact-fit splits and
+        # cannot hold a second transfer buffer once fragmented; the server
+        # must not touch it or any other user-space heap.
+        for forbidden in ("taipool", "malloc(", "calloc(", "realloc("):
+            self.assertNotIn(forbidden, ftp_source)
+            self.assertNotIn(forbidden, main_source)
+        self.assertIsNone(re.search(r"(?m)^[ \t]*free\(", ftp_source))
+        self.assertNotIn("taipool", cmake)
+        self.assertIn("vendor/libftpvita/ftpvita_mem.c", cmake)
+        self.assertIn("SceSysmem_stub_weak", cmake)
 
-        without_safe_free = ftp_source[:safe_free_start] + ftp_source[safe_free_end:]
-        self.assertIsNone(re.search(r"(?m)^[ \t]*free\(", without_safe_free))
-        self.assertIn("result = taipool_init", main_source)
-        self.assertIn("if (result < 0)", main_source)
+        self.assertIn('#include "ftpvita_mem.h"', ftp_source)
+        self.assertIn("SCE_KERNEL_MEMBLOCK_TYPE_USER_RW", mem_source)
+        self.assertIn("sceKernelFindMemBlockByAddr(ptr, 0)", mem_source)
+        self.assertIn("if (ptr == NULL)", mem_source)
+        self.assertIn("FTPVITA_MEM_ALIGN 4096", mem_source)
+
+        # Every allocation in a transfer is released on every exit path.
+        for function, next_function in (
+            ("static void send_file", "static void gen_ftp_fullpath"),
+            ("static void receive_file", "static void cmd_STOR_func"),
+        ):
+            start = ftp_source.index(function)
+            body = ftp_source[start:ftp_source.index(next_function, start)]
+            self.assertEqual(body.count("ftpvita_mem_alloc("), 2)
+            self.assertGreaterEqual(body.count("ftpvita_mem_free(buffer)"), 3)
+            self.assertGreaterEqual(body.count("ftpvita_mem_free(ascii_buffer)"), 2)
+            self.assertIn('"451 Could not allocate a transfer buffer."', body)
+            self.assertNotIn('"550 Could not allocate memory."', body)
 
     def test_public_extension_hooks_reject_null_inputs(self):
         source = (VENDOR / "ftpvita.c").read_text()

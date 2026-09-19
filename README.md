@@ -15,6 +15,16 @@ cmake ..
 make
 ```
 
+Recent CMake releases reject the minimum version declared by the VitaSDK
+toolchain files; if configuration fails with a policy error, add
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5` to the `cmake` line.
+
+The host-side tests only need a C compiler and Python 3:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 For a side-by-side test build that does not replace the canonical
 `1337`/`1338` service, configure distinct ports and a distinct module name:
 
@@ -67,6 +77,26 @@ directories first, use the double-slash URL form:
 curl -q --ftp-method nocwd ftp://IP_TO_VITA:1337//ux0:/somedir/
 ```
 
+Transfer buffers and per-client state are allocated as kernel memory blocks
+rather than from a user-space heap, so long sessions with many transfers do
+not fragment or exhaust a pool.
+
+### Running commands over FTP
+
+The FTP server also accepts `SITE <command chain>`, which runs the same
+commands as the command server and returns the result as a multi-line reply.
+Each FTP client is served on its own thread, so this works even when the
+command port is stuck behind a command that never returns:
+
+```
+printf 'SITE reboot\r\n' | nc IP_TO_VITA 1337
+```
+
+Command clients that support it can send it as `SITE version`,
+`SITE nosleep status` or `SITE press cross; wait 100ms; release cross`.
+Successful replies use code `200`, failed ones `500`, one response line per
+`200-`/`500-` continuation line.
+
 ## Command server
 
 Send a command by opening a TCP connection to the port 1338 of your Vita.
@@ -77,6 +107,12 @@ echo reboot | nc IP_TO_PSVITA 1338
 ```
 
 Note that you need to append a newline character to the command that you send. `echo` already adds one, which is why it works here.
+
+Each connection is served by its own worker thread, so a command that blocks
+(for example a `launch` whose target hangs while booting) does not stall other
+connections. Up to four requests may be in flight at once; while all four are
+busy, only a bare `reboot` is accepted so that the console can always be
+recovered remotely. `SITE reboot` over the FTP port is a second recovery path.
 
 Multiple commands can be executed sequentially by separating them with
 semicolons. The final semicolon is optional:
@@ -101,6 +137,19 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | `wait`    | duration ending in `ms` or `s`  | wait before executing the next chained command |
 
 `wait` accepts integer durations such as `wait 1000ms` and `wait 3s`.
+
+### Recovering a stuck console
+
+`launch` hands the title to the system launcher and can block indefinitely if
+the target never finishes booting (a PSP title launched outside Adrenaline's
+own boot chain, for instance). The worker that ran it stays stuck, but the
+port keeps answering. Recovery options, in order of preference:
+
+1. `echo reboot | nc IP_TO_PSVITA 1338` — always accepted, even when every
+   worker is busy.
+2. `printf 'SITE reboot\r\n' | nc IP_TO_PSVITA 1337` — same command over the
+   FTP server, which serves each client on a separate thread.
+3. A physical power-hold, if the network itself is gone.
 
 Buttons use the following form:
 
