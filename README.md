@@ -6,6 +6,11 @@ Vitacompanion is a user module which makes developing homebrews for the PS Vita 
 - Listens to commands on port 1338
 - Simulates controller and touch input through a small kernel module
 
+This is a fork of [devnoname120/vitacompanion](https://github.com/devnoname120/vitacompanion)
+that fixes two reliability problems in long unattended sessions: FTP transfers
+failing after a few dozen files, and the command port locking up for good when a
+launched application hangs. See [Changes from upstream](#changes-from-upstream).
+
 # Build
 
 ```bash
@@ -194,6 +199,25 @@ Use `release all` to clear every synthetic button, stick, and touch.
  
  https://github.com/imcquee/vitacompanion-VSCODE
  
+# Changes from upstream
+
+Based on upstream `d467723`. Behaviour differences to be aware of when moving
+scripts over:
+
+- **FTP transfers no longer degrade over a session.** Upstream allocates
+  transfer buffers from a small user-space pool that fragments and corrupts
+  itself after roughly 60 transfers, after which `RETR`/`STOR` fail while
+  `LIST` still works. Buffers are now kernel memory blocks. Allocation failures
+  reply `451` instead of `550`.
+- **The command port survives a hung command.** Each connection runs on its
+  own worker thread, up to four at a time. Scripts that assumed commands were
+  serialised across connections should chain them in one request instead.
+  While all workers are busy, other requests get
+  `Error: Too many commands in progress; only 'reboot' is accepted until one finishes.`
+- **`SITE <command chain>` on the FTP port** runs command-port commands and
+  is the fallback for `reboot` if the command port is ever unreachable.
+- Module version reports `1.08`.
+
 # Acknowledgements 
 
 Thanks to xerpi for his [vita-ftploader](https://bitbucket.org/xerpi/vita-ftploader/src/87ef1d13a8aa/plugin/?at=master) plugin, I stole a lot of his code (with his permission). Thanks to cpasjuste for [PSP2SHELL](https://github.com/Cpasjuste/PSP2SHELL), it inspired me to create this tool.
